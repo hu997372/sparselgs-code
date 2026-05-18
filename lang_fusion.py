@@ -5,7 +5,7 @@ import cv2
 import matplotlib.pyplot as pl
 import sys
 sys.path.append("./dust3r")
-# sys.path.append('./Roma')
+sys.path.append("./RoMa-main")
 from romatch.utils.utils import tensor_to_pil
 
 from romatch import roma_outdoor, roma_indoor
@@ -22,7 +22,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.set_default_dtype(torch.float32)
 # device = 'cpu'
 
-def move_folder(old_feature_path, feature_path):
+def move_folder(old_feature_path, feature_path, refresh=False):
+    if refresh and os.path.exists(old_feature_path):
+        shutil.rmtree(old_feature_path)
     if not os.path.exists(old_feature_path):
         # os.mkdir(old_feature_path)
         shutil.copytree(feature_path, old_feature_path)
@@ -308,12 +310,12 @@ def fusion(data_dir):
                 ref_view_x, ref_view_y = now_x[src_mask], now_y[src_mask]
             src_seg, src_feature, src_feature_512 = seg_map_list[src_view], language_feature_list[src_view], language_feature_list_512[src_view]
             count_src_ori = Counter(src_seg.reshape(-1).detach().cpu().numpy())
-            count_src_ori.pop(-1)
+            count_src_ori.pop(-1, None)
 
             # print(src_view_x.max(), src_view_x.min())
             src_ind, ref_ind = src_seg[src_view_y, src_view_x], ref_seg[ref_view_x, ref_view_y]
             count_ref = Counter(ref_ind.detach().cpu().numpy())
-            count_ref.pop(-1)
+            count_ref.pop(-1, None)
             # print(count_ref)
             for k_ref, v_ref in count_ref.items():
                 ref_bool = (ref_ind == k_ref)
@@ -322,7 +324,7 @@ def fusion(data_dir):
                 map_src = torch.cat([src_view_x[:, None], src_view_y[:, None]], dim=1)
                 map_ref = torch.cat([ref_view_y[:, None], ref_view_x[:, None]], dim=1)
                 if -1 in count_src:
-                    count_src.pop(-1)
+                    count_src.pop(-1, None)
                 if not bool(count_src):
                     continue
                 # print(get_2_index, map2)
@@ -361,7 +363,7 @@ def roma_match():
         # vis_mask(seg_mask=seg_map1, output_filename='seg_map1.png')
         img1_path = os.path.join(img_path, image_name_1 + '.' + image_lat)
         count1_ori = Counter(seg_map1.reshape(-1).detach().cpu().numpy())
-        count1_ori.pop(-1)
+        count1_ori.pop(-1, None)
 
         # for view_2 in range(view_1 + 1, num_views):
         for view_2 in range(num_views):
@@ -375,7 +377,7 @@ def roma_match():
 
             img2_path = os.path.join(img_path, image_name_2 + '.' + image_lat)
             count2_ori = Counter(seg_map2.reshape(-1).detach().cpu().numpy())
-            count2_ori.pop(-1)  # a dict describe the number of values in seg_map
+            count2_ori.pop(-1, None)  # a dict describe the number of values in seg_map
 
             # Match
             warp, certainty = roma_model.match(img1_path, img2_path, device='cuda')
@@ -397,9 +399,9 @@ def roma_match():
             # bool 数组作为 index 作用返回得是一维向量
             count1, count2 = Counter(seg_map1[certain_map].detach().cpu().numpy()), Counter(seg_map2[certain_map].detach().cpu().numpy())
             if -1 in count1:
-                count1.pop(-1)
+                count1.pop(-1, None)
             if -1 in count2:
-                count2.pop(-1)
+                count2.pop(-1, None)
             
             # let feature map 1 be a standard, project feature map 2's corresponding feature to feature map 1
             lens = 0
@@ -415,7 +417,7 @@ def roma_match():
                 get_2_index = seg_map2[map2[:, 1], map2[:, 0]]
                 count_now_2 = Counter(get_2_index.detach().cpu().numpy())
                 if -1 in count_now_2:
-                    count_now_2.pop(-1)
+                    count_now_2.pop(-1, None)
                 if not count_now_2:
                     continue
                 # print(get_2_index, map2)
@@ -468,15 +470,22 @@ def mask_fusion(num_views, big_mask_collision):
 
 from argparse import ArgumentParser
 parser = ArgumentParser(description="prompt any label")
-parser.add_argument('--dataname', type=str, default=None)
+parser.add_argument('--dataname', type=str, required=True)
 parser.add_argument('--feature_level', type=int, default=2)
-args = parser.parse_args()
+parser.add_argument('--n_views', type=int, default=None)
+parser.add_argument('--refresh_origin', action='store_true')
+parser.add_argument('--no_visualization', action='store_true')
+parser.add_argument("--save_path", default="./data/match_results", type=str)
+args, _ = parser.parse_known_args()
 dataname = args.dataname
 feature_level = args.feature_level
 
-n_view = 4
-if dataname not in ['teatime', 'ramen', 'waldo_kitchen', 'figurines']:
-    n_view = 3
+if args.n_views is not None:
+    n_view = args.n_views
+else:
+    n_view = 4
+    if dataname not in ['teatime', 'ramen', 'waldo_kitchen', 'figurines']:
+        n_view = 3
 img_path = './data/{}/dust3r_{}_views/images'.format(dataname, n_view)
 camera_path = './data/{}/dust3r_{}_views/sparse/0/'.format(dataname, n_view)
 # dino_path = './data/{}/dino_feature/fit_3d'.format(dataname)
@@ -513,7 +522,7 @@ roma_model = roma_indoor(device='cuda', coarse_res=560, upsample_res=(height, wi
 H, W = roma_model.get_output_resolution()
 for_debug = False
 look_match = False
-look_feature = True
+look_feature = not args.no_visualization
 # big_mask_fusion = True
 big_mask_fusion = False
 
@@ -591,8 +600,8 @@ big_mask_fusion = False
 # dist_base = 1/8 * times
 # rel_diff_base = 1/10 * times
 
-# figurines feature_level = 1
-feature_level = 2
+# Default fusion thresholds. Override feature_level from CLI instead of
+# hard-coding one scene-specific setting here.
 area_bar = 0.3
 total_score_bar = 0.5
 fusion_score_bar = 0.5
@@ -639,11 +648,6 @@ if feature_level in [2, 3]:
     big_mask_fusion = True
 # big_mask_fusion = False
 
-parser = ArgumentParser()
-# img_path = '/home/hu997372/code/InstantSplat/data/images'
-parser.add_argument("--save_path", default="./data/match_results", type=str)
-
-args, _ = parser.parse_known_args()
 save_path = os.path.join(args.save_path, 'match.jpg')
 
 language_feature_list, language_feature_list_512, seg_map_list = [], [], []
@@ -653,8 +657,8 @@ fusion_score_list = []
 big_mask_collision = []
 
 origin_path = ['./data/{}/dust3r_{}_views/language_features_origin'.format(dataname, n_view), './data/{}/dust3r_{}_views/language_features_origin_dim3'.format(dataname, n_view)]
-move_folder(origin_path[0], lf_path_512)
-move_folder(origin_path[1], lf_path)
+move_folder(origin_path[0], lf_path_512, refresh=args.refresh_origin)
+move_folder(origin_path[1], lf_path, refresh=args.refresh_origin)
 
 for image_name in image_name_list:
     language_feature, seg_map = get_language_feature(origin_path[1], feature_level, height, width, image_name)
@@ -672,14 +676,14 @@ for image_name in image_name_list:
 print('Roma feature matching process')
 roma_match()
 
-if look_feature:
-    for now_view, image_name in enumerate(image_name_list):
+for now_view, image_name in enumerate(image_name_list):
+    if big_mask_fusion:
+        fusion_delete(now_view)
+    if look_feature:
         language_feature, seg_map = language_feature_list[now_view], seg_map_list[now_view]
         get_language_feature_old(origin_path[1], feature_level, height, width, image_name)
         np.save(os.path.join(lf_path, image_name + '_f.npy'), language_feature.detach().cpu().numpy())
         vis_language_feature_new(lf_path, image_name, height, width, os.path.join(npy_dir_new, 'before_fusion'))
-        if big_mask_fusion:
-            fusion_delete(now_view)
         if big_mask_collision[now_view]:
             for key in big_mask_collision[now_view]:
                 now_msk = big_mask_collision[now_view][key]

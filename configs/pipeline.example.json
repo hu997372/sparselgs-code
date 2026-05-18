@@ -1,0 +1,37 @@
+{
+  "dataset": "waldo_kitchen",
+  "n_views": null,
+  "iterations": 1000,
+  "base_feature_level": 3,
+  "feature_levels": [2],
+  "stages": {
+    "dust3r_init": false,
+    "rgb_train": true,
+    "sam_clip": true,
+    "autoencoder": false,
+    "lang_fusion": false,
+    "feature_train": true,
+    "render": true,
+    "test_pose_init": false,
+    "copy_geometry_to_source": true,
+    "optim_pose": true
+  },
+  "paths": {
+    "dust3r_ckpt": "./ckpt/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+    "sam_ckpt": "./ckpt/sam_vit_h_4b8939.pth",
+    "start_checkpoint": null
+  },
+  "autoencoder": {
+    "lr": 0.0007
+  },
+  "lang_fusion": {
+    "feature_level": 2,
+    "refresh_origin": false,
+    "visualize": false
+  },
+  "render": {
+    "feature_checkpoint_iteration": 1000,
+    "optimize_test_pose": false,
+    "optim_test_pose_iter": 0
+  }
+}

@@ -79,12 +79,13 @@ def render_set_optimize(model_path, source_path, name, iteration, views, gaussia
         gaussians._language_feature.requires_grad_(False)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        # num_iter = 200
         num_iter = args.optim_test_pose_iter
+        if num_iter <= 0:
+            raise ValueError("--optimize_test_pose requires --optim_test_pose_iter > 0")
         camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
 
-        camera_tensor_T = camera_pose[-3:].requires_grad_()
-        camera_tensor_q = camera_pose[:4].requires_grad_()
+        camera_tensor_T = camera_pose[-3:].clone().detach().requires_grad_(True)
+        camera_tensor_q = camera_pose[:4].clone().detach().requires_grad_(True)
         pose_optimizer = torch.optim.Adam(
             [
                 {
@@ -109,7 +110,7 @@ def render_set_optimize(model_path, source_path, name, iteration, views, gaussia
         current_min_loss = float(1e20)
         gt = view.original_image[0:3, :, :]
         for iteration in range(num_iter):
-            rendering = render(view, gaussians, pipeline, background, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))["render"]
+            rendering = render(view, gaussians, pipeline, background, args, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))["render"]
             loss = torch.abs(gt - rendering).mean()
             if iteration%10==0:
                 print(iteration, loss.item())
@@ -137,16 +138,18 @@ def render_set_optimize(model_path, source_path, name, iteration, views, gaussia
         print(opt_pose-camera_pose)
 
         if not args.include_feature:
-            rendering_opt = render(view, gaussians, pipeline, background, camera_pose=opt_pose)["render"]
+            rendering_opt = render(view, gaussians, pipeline, background, args, camera_pose=opt_pose)["render"]
         else:
-            rendering_opt = render(view, gaussians, pipeline, background, camera_pose=opt_pose)["language_feature_image"]
+            rendering_opt = render(view, gaussians, pipeline, background, args, camera_pose=opt_pose)["language_feature_image"]
             
         if not args.include_feature:
             gt = view.original_image[0:3, :, :]
         else:
             gt, mask = view.get_language_feature(os.path.join(source_path, args.language_features_name), feature_level=args.feature_level)
         
-        np.save(os.path.join(render_npy_path, '{0:05d}'.format(idx) + ".npy"),rendering.permute(1,2,0).cpu().numpy())
+        rendering_opt = rendering_opt.detach()
+        gt = gt.detach()
+        np.save(os.path.join(render_npy_path, '{0:05d}'.format(idx) + ".npy"),rendering_opt.permute(1,2,0).cpu().numpy())
         np.save(os.path.join(gts_npy_path, '{0:05d}'.format(idx) + ".npy"),gt.permute(1,2,0).cpu().numpy())
         torchvision.utils.save_image(
             rendering_opt, os.path.join(render_path, "{0:05d}".format(idx) + ".png")
@@ -164,19 +167,18 @@ def render_sets(
     skip_test: bool,
     args,
 ):
-    with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, opt=args, shuffle=False)
-        if args.include_feature:
-            # checkpoint = os.path.join(args.model_path, 'chkpnt100.pth')
-            checkpoint = os.path.join(args.model_path, 'chkpnt1000.pth')
-            (model_params, first_iter) = torch.load(checkpoint)
-            gaussians.restore(model_params, args, mode='test')
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians, load_iteration=iteration, opt=args, shuffle=False)
+    if args.include_feature:
+        checkpoint = os.path.join(args.model_path, f'chkpnt{args.feature_checkpoint_iteration}.pth')
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, args, mode='test')
 
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if not skip_train:
+    if not skip_train:
+        with torch.no_grad():
             render_set(
                 dataset.model_path,
                 dataset.source_path,
@@ -189,19 +191,9 @@ def render_sets(
                 args,
             )
 
-        if not skip_test:
-            # render_set_optimize(
-            #     dataset.model_path,
-            #     dataset.source_path,
-            #     "test",
-            #     scene.loaded_iter,
-            #     scene.getTestCameras(),
-            #     gaussians,
-            #     pipeline,
-            #     background,
-            #     args,
-            # )
-            render_set(
+    if not skip_test:
+        if args.optimize_test_pose:
+            render_set_optimize(
                 dataset.model_path,
                 dataset.source_path,
                 "test",
@@ -212,6 +204,19 @@ def render_sets(
                 background,
                 args,
             )
+        else:
+            with torch.no_grad():
+                render_set(
+                    dataset.model_path,
+                    dataset.source_path,
+                    "test",
+                    scene.loaded_iter,
+                    scene.getTestCameras(),
+                    gaussians,
+                    pipeline,
+                    background,
+                    args,
+                )
 
 
 if __name__ == "__main__":
@@ -229,8 +234,14 @@ if __name__ == "__main__":
     parser.add_argument("--get_video", action="store_true")
     parser.add_argument("--n_views", default=None, type=int)
     parser.add_argument("--scene", default=None, type=str)
-    parser.add_argument("--optim_test_pose_iter", default=500, type=int)
+    parser.add_argument("--optimize_test_pose", action="store_true")
+    parser.add_argument("--optim_test_pose_iter", default=0, type=int)
+    parser.add_argument("--feature_checkpoint_iteration", default=1000, type=int)
     args = get_combined_args(parser)
+    if args.optimize_test_pose and args.optim_test_pose_iter <= 0:
+        args.optim_test_pose_iter = 500
+    if not args.optimize_test_pose and args.optim_test_pose_iter > 0:
+        print("Ignoring --optim_test_pose_iter because --optimize_test_pose is not set.")
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
