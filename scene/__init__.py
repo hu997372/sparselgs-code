@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -82,8 +82,16 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            self.gaussians.create_from_pcd(
+                scene_info.point_cloud,
+                self.cameras_extent,
+                max_init_points=getattr(opt, "max_init_points", 0),
+                init_point_seed=getattr(opt, "init_point_seed", 0),
+                max_init_scale=getattr(opt, "max_init_scale", 0.0),
+            )
             self.gaussians.init_RT_seq(self.train_cameras)
+            if self.test_cameras[1.0]:
+                self.gaussians.init_test_RT_seq(self.test_cameras)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

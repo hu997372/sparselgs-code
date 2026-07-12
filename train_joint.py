@@ -3,13 +3,14 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
 import os
+import random
 import numpy as np
 import torch
 from random import randint
@@ -29,21 +30,17 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
-    
+
 from time import perf_counter
 
 def save_pose(path, quat_pose, train_cams, llffhold=2):
     output_poses=[]
-    index_colmap = [cam.colmap_id for cam in train_cams]
     for quat_t in quat_pose:
         w2c = get_camera_from_tensor(quat_t)
         output_poses.append(w2c)
-    colmap_poses = []
-    for i in range(len(index_colmap)):
-        ind = index_colmap.index(i+1)
-        bb=output_poses[ind]
-        bb = bb#.inverse()
-        colmap_poses.append(bb)
+    # Map poses by index (not colmap_id, which may be non-sequential)
+    # quat_pose and train_cams are in the same order
+    colmap_poses = [output_poses[i] for i in range(len(train_cams))]
     colmap_poses = torch.stack(colmap_poses).detach().cpu().numpy()
     np.save(path, colmap_poses)
 
@@ -52,7 +49,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, opt=args, shuffle=False)                                                                      
+    scene = Scene(dataset, gaussians, opt=args, shuffle=False)
     gaussians.training_setup(opt)
     print(checkpoint)
     look_test = False
@@ -62,7 +59,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             raise ValueError("checkpoint missing!!!!!")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
-        if len(model_params) == 13 and opt.include_feature:
+        if args.reset_start_iteration or (len(model_params) == 13 and opt.include_feature):
             first_iter = 0
         gaussians.restore(model_params, opt)
 
@@ -81,7 +78,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter += 1
 
     start = perf_counter()
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -98,6 +95,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         pose = gaussians.get_RT(viewpoint_cam.uid)
+        if not args.optim_pose:
+            # The CUDA rasterizer is more stable when camera_pose participates
+            # in autograd, even if we do not step the train camera parameter.
+            pose = pose.detach().clone().requires_grad_(True)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -107,6 +108,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, opt, camera_pose=pose)
         image, language_feature, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["language_feature_image"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        torch.cuda.synchronize()  # DEBUG
 
         # Loss
         # print(opt.include_feature)
@@ -124,10 +126,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 img = cv2.cvtColor(feature_look, cv2.COLOR_RGB2BGR)
                 cv2.imwrite('./look_img.jpg', img*255)
 
-            Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)    
-            l_rgb = l1_loss(image, gt_image)        
+            Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)
+            l_rgb = l1_loss(image, gt_image)
             loss = (1 - opt.lambda_rgb) * Ll1 + opt.lambda_rgb * l_rgb
-            # loss = Ll1 
+            # loss = Ll1
         else:
             gt_image = viewpoint_cam.original_image.cuda()
 
@@ -143,7 +145,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        torch.cuda.synchronize()  # DEBUG
         loss.backward()
+        torch.cuda.synchronize()  # DEBUG
         # for param_group in gaussians.optimizer.param_groups:
         #     for param in param_group['params']:
         #         if param is gaussians.P:
@@ -180,7 +184,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                    
+
                     if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                         gaussians.reset_opacity()
 
@@ -192,24 +196,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(opt.include_feature), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                
+
         end = perf_counter()
         train_time = end - start
-    
+
     # We commented out log&save operations, and then calculate train time.
     # train_time = np.array(train_time)
     # print("total_test_time_epoch: ", 1)
     # print("instantsplat_train_time_mean: ", train_time.mean())
     # print("instantsplat_train_time_median: ", np.median(train_time))
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -233,7 +237,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(len(scene.getTrainCameras()))]})
 
         for config in validation_configs:
@@ -254,7 +258,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -285,8 +289,19 @@ if __name__ == "__main__":
     parser.add_argument("--get_video", action="store_true")
     parser.add_argument("--optim_pose", action="store_true")
     parser.add_argument("--include_feature_get", type=int)
+    parser.add_argument("--max_init_points", type=int, default=0,
+                        help="Randomly cap the initial point cloud before training; 0 keeps all points.")
+    parser.add_argument("--init_point_seed", type=int, default=0)
+    parser.add_argument("--max_init_scale", type=float, default=0.0,
+                        help="Clamp initial Gaussian scale; 0 disables clamping.")
+    parser.add_argument("--reset_start_iteration", action="store_true",
+                        help="Load checkpoint parameters but train from iteration 1.")
+    parser.add_argument("--seed", type=int, default=-1,
+                        help="Set Python/NumPy/Torch RNG seed; negative keeps current behavior.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    if args.iterations not in args.checkpoint_iterations:
+        args.checkpoint_iterations.append(args.iterations)
     print(args)
     args.model_path = args.model_path + f"_{str(args.feature_level)}"
     os.makedirs(args.model_path, exist_ok=True)
@@ -295,6 +310,11 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     # safe_state(args.quiet)
+    if args.seed >= 0:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)

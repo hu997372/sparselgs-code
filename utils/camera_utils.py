@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -48,8 +48,8 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
@@ -163,7 +163,7 @@ def generate_interpolated_path(poses, n_interp, spline_degree=5,
         new_points = np.array(scipy.interpolate.splev(u, tck))
         new_points = np.reshape(new_points.T, (n, sh[1], sh[2]))
         return new_points
-    
+
     ###  Additional operation
     # inter_poses = []
     # for pose in poses:
@@ -180,7 +180,7 @@ def generate_interpolated_path(poses, n_interp, spline_degree=5,
                         n_interp * (points.shape[0] - 1),
                         k=spline_degree,
                         s=smoothness)
-    return points_to_poses(new_points) 
+    return points_to_poses(new_points)
 
 
 def viewmatrix(lookdir, up, position):

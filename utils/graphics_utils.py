@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -50,7 +50,7 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
 
 def getWorld2View2_torch(R, t, translate=torch.tensor([0.0, 0.0, 0.0]), scale=1.0):
     translate = torch.tensor(translate, dtype=torch.float32)
-    
+
     # Initialize the transformation matrix
     Rt = torch.zeros((4, 4), dtype=torch.float32)
     Rt[:3, :3] = R.t()  # Transpose of R
@@ -62,10 +62,10 @@ def getWorld2View2_torch(R, t, translate=torch.tensor([0.0, 0.0, 0.0]), scale=1.
     cam_center = C2W[:3, 3]
     cam_center = (cam_center + translate) * scale
     C2W[:3, 3] = cam_center
-    
+
     # Invert again to get the world-to-view transformation
     Rt = torch.linalg.inv(C2W)
-    
+
     return Rt
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):

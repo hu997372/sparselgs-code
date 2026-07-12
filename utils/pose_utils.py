@@ -526,7 +526,7 @@ def generate_interpolated_path(
         new_points = np.reshape(new_points.T, (len(u), sh[1], sh[2]))
         return new_points, u_keyframes
 
-  
+
     if n_buffer is not None:
         poses = insert_buffer_poses(poses, n_buffer)
     points = poses_to_points(poses, dist=rot_weight)

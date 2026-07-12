@@ -1,714 +1,855 @@
-import torch
-import os
-import numpy as np
-import cv2
-import matplotlib.pyplot as pl
-import sys
-sys.path.append("./dust3r")
-sys.path.append("./RoMa-main")
-from romatch.utils.utils import tensor_to_pil
+#!/usr/bin/env python
+from __future__ import annotations
 
-from romatch import roma_outdoor, roma_indoor
+import argparse
+import json
+import os
+import shutil
+import sys
+import time
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import cv2
+import numpy as np
 import torch
 from PIL import Image
-import torch.nn.functional as F
-import numpy as np
 from tqdm import tqdm
-from argparse import ArgumentParser
-from collections import Counter
-import shutil
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.set_default_dtype(torch.float32)
-# device = 'cpu'
+sys.path.append("./RoMa-main")
+from romatch import roma_indoor, roma_outdoor  # noqa: E402
+from romatch.utils.utils import tensor_to_pil  # noqa: E402
 
-def move_folder(old_feature_path, feature_path, refresh=False):
-    if refresh and os.path.exists(old_feature_path):
-        shutil.rmtree(old_feature_path)
-    if not os.path.exists(old_feature_path):
-        # os.mkdir(old_feature_path)
-        shutil.copytree(feature_path, old_feature_path)
 
-def get_language_feature_old(language_feature_dir, feature_level, height, width, image_name):
-    language_feature_name = os.path.join(language_feature_dir, image_name)
-    seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
-    feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
-    y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
-    x = x.reshape(-1, 1)
-    y = y.reshape(-1, 1)
-    seg = seg_map[:, y, x].squeeze(-1).long()
-    mask = seg != -1
-    # print(seg[0:1].max(), seg[1:2].max(), seg[2:3].max(), seg[3:4].max())
-    # print(seg[0:1].min(), seg[1:2].min(), seg[2:3].min(), seg[3:4].min())
-    if feature_level == 0: # default
-        point_feature1 = feature_map[seg[0:1]].squeeze(0)
-        mask = mask[0:1].reshape(1, height, width)
-    elif feature_level == 1: # s
-        point_feature1 = feature_map[seg[1:2]].squeeze(0)
-        mask = mask[1:2].reshape(1, height, width)
-    elif feature_level == 2: # m
-        point_feature1 = feature_map[seg[2:3]].squeeze(0)
-        mask = mask[2:3].reshape(1, height, width)
-    elif feature_level == 3: # l
-        point_feature1 = feature_map[seg[3:4]].squeeze(0)
-        mask = mask[3:4].reshape(1, height, width)
+LEVEL_NAMES = {0: "default", 1: "s", 2: "m", 3: "l"}
+LERF_OVS_4VIEW_SCENES = {"teatime", "ramen", "waldo_kitchen", "figurines"}
+
+
+@dataclass
+class FusionConfig:
+    dataname: str
+    n_views: int
+    feature_levels: tuple[int, ...]
+    device: str
+    matcher: str
+    coarse_res: int
+    match_threshold: float
+    reproject_threshold: float
+    semantic_weight: float
+    fusion_area_threshold: float
+    certainty_threshold: float
+    min_roma_pixels: int
+    min_reproject_pixels: int
+    geom_start: int
+    geom_times: float
+    geom_dist_base: float
+    geom_rel_diff_base: float
+    mask_fusion: str
+    roma_similarity_space: str
+    reproject_similarity_space: str
+    scoring: str
+    refresh_origin: bool
+    visualize: bool
+    save_path: str
+    stats_path: str | None
+    snapshot_dir: str | None
+    dry_run: bool
+
+
+@dataclass
+class StageStats:
+    proposals: int = 0
+    accepted: int = 0
+    overwritten: int = 0
+    mask_fusions: int = 0
+    skipped_small: int = 0
+    skipped_empty: int = 0
+    skipped_oob: int = 0
+
+
+@dataclass
+class ViewFeatures:
+    name: str
+    image_path: Path
+    seg_maps: torch.Tensor
+    feat3: torch.Tensor
+    feat512: torch.Tensor
+
+
+@dataclass
+class Candidate:
+    score: float
+    src_view: int
+    src_seg: int
+    dst_view: int
+    dst_seg: int
+    area_score: float
+    semantic_score: float
+    matched_pixels: int
+    stage: str
+
+
+def parse_levels(args: argparse.Namespace) -> tuple[int, ...]:
+    if args.feature_levels:
+        tokens = args.feature_levels.replace(",", " ").split()
+        levels = tuple(int(token) for token in tokens)
     else:
-        raise ValueError("feature_level=", feature_level)
-    point_feature = point_feature1.reshape(height, width, -1)
-    if point_feature.shape[2] == 3:
-        img = cv2.cvtColor(point_feature.cpu().detach().numpy(), cv2.COLOR_RGB2BGR)
-        save_lan_path = os.path.join(npy_dir_look, image_name + '.jpg')
-        if not os.path.exists(npy_dir_look):
-            os.makedirs(npy_dir_look)
-        cv2.imwrite(save_lan_path, img*255)
-    
-    return point_feature.cuda(), mask.cuda() 
+        levels = (args.feature_level,)
+    bad = [level for level in levels if level not in LEVEL_NAMES]
+    if bad:
+        raise ValueError(f"Unsupported feature levels: {bad}. Use 0, 1, 2, or 3.")
+    return levels
 
-def  get_language_feature(language_feature_dir, feature_level, height, width, image_name):
-    language_feature_name = os.path.join(language_feature_dir, image_name)
-    seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
-    feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
-    # print(seg_map[feature_level,:].shape)
-    
-    y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
-    x = x.reshape(-1, 1)
-    y = y.reshape(-1, 1)
-    seg = seg_map[feature_level, y, x].squeeze(-1).long()
-    return feature_map.to(device), seg.reshape(height, width).to(device)
 
-def vis_language_feature_new(language_feature_dir, image_name, height, width, npy_dir_new):
-    language_feature_name = os.path.join(language_feature_dir, image_name)
-    seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
-    feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
-    if not os.path.exists(npy_dir_new):
-        os.makedirs(npy_dir_new)
-    
-    y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
-    x = x.reshape(-1, 1)
-    y = y.reshape(-1, 1)
-    # print(seg_map.shape, seg_map)
-    seg = seg_map[feature_level, y, x].squeeze(-1).long()
-    # seg = seg_map[y, x].squeeze(-1).long()
-    point_feature = feature_map[seg].squeeze(0).reshape(height, width, -1)
-    if point_feature.shape[2] == 3:
-        img = cv2.cvtColor(point_feature.cpu().detach().numpy(), cv2.COLOR_RGB2BGR)
-        save_lan_path = os.path.join(npy_dir_new, image_name + '.jpg')
-        cv2.imwrite(save_lan_path, img*255)
+def infer_n_views(dataname: str, explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit
+    return 4 if dataname in LERF_OVS_4VIEW_SCENES else 3
 
-def visual_match(img1_path, img2_path, warp, certainty):
-    # visualization
-    # im1 = Image.open(img1_path).resize((W, H))
-    im2 = Image.open(img2_path).resize((W, H))
-    # x1 = (torch.tensor(np.array(im1)) / 255).to(device).permute(2, 0, 1)
-    x2 = (torch.tensor(np.array(im2)) / 255).to(device).permute(2, 0, 1)
-    im2_transfer_rgb = F.grid_sample(x2[None], warp[:, :, 2:][None], mode="bilinear", align_corners=False)[0]
-    warp_im = im2_transfer_rgb
-    white_im = torch.ones((H, W), device=device)
-    vis_im = certainty * warp_im + (1 - certainty) * white_im
-    tensor_to_pil(vis_im, unnormalize=False).save(save_path)
 
-def vis_mask(seg_mask, output_filename):
-    array = seg_mask.reshape(H, W).detach().cpu().numpy()
-    unique_values = np.unique(array)
-    color_map = {}
-    for value in unique_values:
-        color_map[value] = np.random.randint(0, 256, size=(3,))
+def copy_origin(origin_dir: Path, feature_dir: Path, refresh: bool) -> None:
+    if refresh and origin_dir.exists():
+        shutil.rmtree(origin_dir)
+    if not origin_dir.exists():
+        shutil.copytree(feature_dir, origin_dir)
 
-    h, w = array.shape
-    color_image = np.zeros((h, w, 3), dtype=np.uint8)
 
-    for value in unique_values:
-        # print(value)
-        if value != -1:
-            continue
-        color_image[array == value] = color_map[value]
+def sorted_images(image_dir: Path) -> list[Path]:
+    images = sorted(
+        p for p in image_dir.iterdir()
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+    if not images:
+        raise FileNotFoundError(f"No images found in {image_dir}")
+    return images
 
-    cv2.imwrite(output_filename, cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR))
 
-def vis_match_single(img1_path, img2_path, map1, map2, k1):
-    im1 = Image.open(img1_path).resize((W, H))
-    im2 = Image.open(img2_path).resize((W, H))
-    x1 = (torch.tensor(np.array(im1)) / 255).to(device).permute(2, 0, 1)
-    x2 = (torch.tensor(np.array(im2)) / 255).to(device).permute(2, 0, 1)
-    black_im1 = torch.zeros((3, H, W), device=device)
-    black_im2 = torch.zeros((3, H, W), device=device)
-    black_im1[:, map1[:, 1], map1[:, 0]] = x1[:, map1[:, 1], map1[:, 0]]
-    black_im2[:, map2[:, 1], map2[:, 0]] = x2[:, map2[:, 1], map2[:, 0]]
-    if not os.path.exists(args.save_path):
-        os.makedirs(args.save_path)
-    tensor_to_pil(black_im1, unnormalize=False).save(os.path.join(args.save_path, 'visual1_{}.jpg'.format(k1)))
-    tensor_to_pil(black_im2, unnormalize=False).save(os.path.join(args.save_path, 'visual2_{}.jpg'.format(k1)))
+def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    denom = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
+    if float(denom) <= 1e-12:
+        return 0.0
+    return float(torch.dot(a, b) / denom)
 
-def cos_loss(x, y):
-    return torch.sum(x * y) / (x.norm() * y.norm())
 
-def fusion_delete(now_view):
-    key_to_delete = []
-    now_collision = big_mask_collision[now_view]
-    for key in now_collision:
-        if len(now_collision[key]) <= 1:
-            key_to_delete.append(key)
+def valid_counter(values: torch.Tensor) -> Counter:
+    counter = Counter(values.detach().cpu().numpy().reshape(-1).tolist())
+    counter.pop(-1, None)
+    return counter
+
+
+def majority_key(counter: Counter) -> int | None:
+    if not counter:
+        return None
+    return int(max(counter, key=lambda key: counter[key]))
+
+
+def safe_index_feature(features: torch.Tensor, index: int) -> torch.Tensor | None:
+    if index < 0 or index >= features.shape[0]:
+        return None
+    return features[index]
+
+
+def save_feature_visualization(
+    feature_dir: Path,
+    image_name: str,
+    level: int,
+    height: int,
+    width: int,
+    out_dir: Path,
+) -> None:
+    seg_map = torch.from_numpy(np.load(feature_dir / f"{image_name}_s.npy"))
+    feature_map = torch.from_numpy(np.load(feature_dir / f"{image_name}_f.npy"))
+    yy, xx = torch.meshgrid(
+        torch.arange(height),
+        torch.arange(width),
+        indexing="ij",
+    )
+    seg = seg_map[level, yy, xx].long()
+    point_feature = feature_map[seg].reshape(height, width, -1)
+    if point_feature.shape[2] != 3:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = cv2.cvtColor(point_feature.detach().cpu().numpy(), cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(out_dir / f"{image_name}.jpg"), img * 255)
+
+
+def save_match_visual(
+    image_a: Path,
+    image_b: Path,
+    map_a_xy: torch.Tensor,
+    map_b_xy: torch.Tensor,
+    height: int,
+    width: int,
+    save_dir: Path,
+    name: str,
+    device: torch.device,
+) -> None:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    im_a = Image.open(image_a).resize((width, height))
+    im_b = Image.open(image_b).resize((width, height))
+    x_a = (torch.tensor(np.array(im_a)) / 255).to(device).permute(2, 0, 1)
+    x_b = (torch.tensor(np.array(im_b)) / 255).to(device).permute(2, 0, 1)
+    blank_a = torch.zeros((3, height, width), device=device)
+    blank_b = torch.zeros((3, height, width), device=device)
+    map_a_xy = map_a_xy.long()
+    map_b_xy = map_b_xy.long()
+    blank_a[:, map_a_xy[:, 1], map_a_xy[:, 0]] = x_a[:, map_a_xy[:, 1], map_a_xy[:, 0]]
+    blank_b[:, map_b_xy[:, 1], map_b_xy[:, 0]] = x_b[:, map_b_xy[:, 1], map_b_xy[:, 0]]
+    tensor_to_pil(blank_a, unnormalize=False).save(save_dir / f"{name}_a.jpg")
+    tensor_to_pil(blank_b, unnormalize=False).save(save_dir / f"{name}_b.jpg")
+
+
+class SemanticFusion:
+    def __init__(self, config: FusionConfig) -> None:
+        self.config = config
+        self.device = torch.device(
+            config.device if torch.cuda.is_available() or config.device == "cpu" else "cpu"
+        )
+        self.data_root = Path("data") / config.dataname / f"dust3r_{config.n_views}_views"
+        self.image_dir = self.data_root / "images"
+        self.camera_dir = self.data_root / "sparse" / "0"
+        self.feat512_dir = self.data_root / "language_features"
+        self.feat3_dir = self.data_root / "language_features_dim3"
+        self.origin512_dir = self.data_root / "language_features_origin"
+        self.origin3_dir = self.data_root / "language_features_origin_dim3"
+        self.look_dir = self.data_root / "language_feature_renew_look"
+        self.views: list[ViewFeatures] = []
+        self.height = 0
+        self.width = 0
+        self.matcher_height = 0
+        self.matcher_width = 0
+        self.matcher_model = None
+        self.stats: dict[str, StageStats] = defaultdict(StageStats)
+        self.best_updates: dict[tuple[str, int, int], Candidate] = {}
+        self.mask_collision: dict[int, dict[int, list[Candidate]]] = defaultdict(lambda: defaultdict(list))
+        self.accepted_updates: list[dict] = []
+
+    def run(self) -> dict:
+        self.prepare_origins()
+        self.load_views()
+        self.init_matcher()
+
+        for level in self.config.feature_levels:
+            print(f"Semantic alignment level={level} ({LEVEL_NAMES[level]})")
+            self.best_updates.clear()
+            self.mask_collision.clear()
+            self.roma_stage(level)
+            self.save_snapshot(level, "01_roma")
+            self.mask_fusion_stage(level)
+            self.save_snapshot(level, "02_mask_fusion")
+            self.reprojection_stage(level)
+            self.save_snapshot(level, "03_reprojection")
+            if self.config.visualize:
+                self.visualize_level(level)
+
+        if not self.config.dry_run:
+            self.save_features()
+
+        summary = self.summary()
+        if self.config.stats_path:
+            stats_path = Path(self.config.stats_path)
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(stats_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+        print(json.dumps(summary, indent=2))
+        return summary
+
+    def prepare_origins(self) -> None:
+        for path in [self.image_dir, self.feat512_dir, self.feat3_dir, self.camera_dir]:
+            if not path.exists():
+                raise FileNotFoundError(path)
+        copy_origin(self.origin512_dir, self.feat512_dir, self.config.refresh_origin)
+        copy_origin(self.origin3_dir, self.feat3_dir, self.config.refresh_origin)
+
+    def load_views(self) -> None:
+        image_paths = sorted_images(self.image_dir)
+        first = cv2.imread(str(image_paths[0]))
+        if first is None:
+            raise RuntimeError(f"Failed to read image: {image_paths[0]}")
+        self.height, self.width = first.shape[:2]
+
+        self.views = []
+        for image_path in image_paths:
+            stem = image_path.stem
+            seg_path = self.origin3_dir / f"{stem}_s.npy"
+            feat3_path = self.origin3_dir / f"{stem}_f.npy"
+            feat512_path = self.origin512_dir / f"{stem}_f.npy"
+            for path in [seg_path, feat3_path, feat512_path]:
+                if not path.exists():
+                    raise FileNotFoundError(path)
+            self.views.append(
+                ViewFeatures(
+                    name=stem,
+                    image_path=image_path,
+                    seg_maps=torch.from_numpy(np.load(seg_path)).long().to(self.device),
+                    feat3=torch.from_numpy(np.load(feat3_path).astype(np.float32)).to(self.device),
+                    feat512=torch.from_numpy(np.load(feat512_path).astype(np.float32)).to(self.device),
+                )
+            )
+        if len(self.views) != self.config.n_views:
+            print(
+                f"[WARN] n_views={self.config.n_views}, but found {len(self.views)} images in {self.image_dir}"
+            )
+
+    def init_matcher(self) -> None:
+        if self.config.matcher == "roma_outdoor":
+            self.matcher_model = roma_outdoor(
+                device=str(self.device),
+                coarse_res=self.config.coarse_res,
+                upsample_res=(self.height, self.width),
+            )
         else:
-            dict_count = dict()
-            for index, num in enumerate(now_collision[key]):
-                if num[1] not in dict_count:
-                    dict_count[num[1]] = [1, num]
-                else:
-                    dict_count[num[1]] = [100, index]
-            flag = False
-            for key0 in dict_count:
-                if dict_count[key0][0] > 1:
-                    flag = True
-                else:
-                    now_collision[key].remove(dict_count[key0][1])
-            if flag == False:
-                key_to_delete.append(key)
-    for key in key_to_delete:
-        del now_collision[key]
-    if look_feature:
-        file = open('output.txt', mode='wt', encoding='utf-8')
-        file.write(str(big_mask_collision[now_view]) + '\n \n')
+            self.matcher_model = roma_indoor(
+                device=str(self.device),
+                coarse_res=self.config.coarse_res,
+                upsample_res=(self.height, self.width),
+            )
+        self.matcher_height, self.matcher_width = self.matcher_model.get_output_resolution()
 
-# project the reference point cloud into the source view, then project back
-def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src):
-    width, height = depth_ref.shape[1], depth_ref.shape[0]
-    ## step1. project reference pixels to the source view
-    # reference view x, y
-    x_ref, y_ref = np.meshgrid(np.arange(0, width), np.arange(0, height))
-    x_ref, y_ref = x_ref.reshape([-1]), y_ref.reshape([-1])
-    # reference 3D space
-    xyz_ref = np.matmul(np.linalg.inv(intrinsics_ref),
-                        np.vstack((x_ref, y_ref, np.ones_like(x_ref))) * depth_ref.reshape([-1]))
-    # source 3D space
-    xyz_src = np.matmul(np.matmul(extrinsics_src, np.linalg.inv(extrinsics_ref)),
-                        np.vstack((xyz_ref, np.ones_like(x_ref))))[:3]
-    # source view x, y
-    K_xyz_src = np.matmul(intrinsics_src, xyz_src)
-    xy_src = K_xyz_src[:2] / K_xyz_src[2:3]
+    def segment_area(self, view_id: int, level: int) -> Counter:
+        return valid_counter(self.views[view_id].seg_maps[level])
 
-    ## step2. reproject the source view points with source view depth estimation
-    # find the depth estimation of the source view
-    x_src = xy_src[0].reshape([height, width]).astype(np.float32)
-    y_src = xy_src[1].reshape([height, width]).astype(np.float32)
-    sampled_depth_src = cv2.remap(depth_src, x_src, y_src, interpolation=cv2.INTER_LINEAR)
-    sample_without_b = sampled_depth_src > 0
-    # exit()
-    # mask = sampled_depth_src > 0
+    def segment_similarity(self, src_view: int, src_seg: int, dst_view: int, dst_seg: int, space: str) -> float:
+        src = self.views[src_view]
+        dst = self.views[dst_view]
+        if space == "low":
+            src_feat = safe_index_feature(src.feat3, src_seg)
+            dst_feat = safe_index_feature(dst.feat3, dst_seg)
+        else:
+            src_feat = safe_index_feature(src.feat512, src_seg)
+            dst_feat = safe_index_feature(dst.feat512, dst_seg)
+        if src_feat is None or dst_feat is None:
+            return 0.0
+        return cosine(src_feat, dst_feat)
 
-    # source 3D space
-    # NOTE that we should use sampled source-view depth_here to project back
-    xyz_src = np.matmul(np.linalg.inv(intrinsics_src),
-                        np.vstack((xy_src, np.ones_like(x_ref))) * sampled_depth_src.reshape([-1]))
-    # reference 3D space
-    xyz_reprojected = np.matmul(np.matmul(extrinsics_ref, np.linalg.inv(extrinsics_src)),
-                                np.vstack((xyz_src, np.ones_like(x_ref))))[:3]
-    # source view x, y, depth
-    depth_reprojected = xyz_reprojected[2].reshape([height, width]).astype(np.float32)
-    K_xyz_reprojected = np.matmul(intrinsics_ref, xyz_reprojected)
-    K_xyz_reprojected[2:3][K_xyz_reprojected[2:3]==0] += 0.00001
-    xy_reprojected = K_xyz_reprojected[:2] / K_xyz_reprojected[2:3]
-    x_reprojected = xy_reprojected[0].reshape([height, width]).astype(np.float32)
-    y_reprojected = xy_reprojected[1].reshape([height, width]).astype(np.float32)
+    def score(self, area_score: float, semantic_score: float) -> float:
+        sem_w = self.config.semantic_weight
+        return (1.0 - sem_w) * area_score + sem_w * semantic_score
 
-    return depth_reprojected, x_reprojected, y_reprojected, x_src, y_src, sample_without_b
+    def apply_candidate(
+        self,
+        candidate: Candidate,
+        threshold: float,
+        best_scope: str,
+    ) -> bool:
+        if candidate.score <= threshold:
+            return False
+        dst = self.views[candidate.dst_view]
+        src = self.views[candidate.src_view]
+        src_feat3 = safe_index_feature(src.feat3, candidate.src_seg)
+        src_feat512 = safe_index_feature(src.feat512, candidate.src_seg)
+        if src_feat3 is None or src_feat512 is None:
+            return False
+        dst_feat3 = safe_index_feature(dst.feat3, candidate.dst_seg)
+        dst_feat512 = safe_index_feature(dst.feat512, candidate.dst_seg)
+        if dst_feat3 is None or dst_feat512 is None:
+            return False
 
-def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src):
-    width, height = depth_ref.shape[1], depth_ref.shape[0]
-    x_ref, y_ref = np.meshgrid(np.arange(0, width), np.arange(0, height))
-    # x2d_src, y2d_src  ref视角投影到src上的结果
-    depth_reprojected, x2d_reprojected, y2d_reprojected, x2d_src, y2d_src, ref_without_b = reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref,
-                                                                                                 depth_src, intrinsics_src, extrinsics_src)
-    dist = np.sqrt((x2d_reprojected - x_ref) ** 2 + (y2d_reprojected - y_ref) ** 2)
+        key = (best_scope, candidate.dst_view, candidate.dst_seg)
+        previous = self.best_updates.get(key)
+        if previous is not None and previous.score >= candidate.score:
+            return False
 
-    depth_diff = np.abs(depth_reprojected - depth_ref)
-    relative_depth_diff = depth_diff / depth_ref 
+        dst.feat3[candidate.dst_seg] = src_feat3
+        dst.feat512[candidate.dst_seg] = src_feat512
+        self.best_updates[key] = candidate
+        stat = self.stats[candidate.stage]
+        stat.accepted += 1
+        if previous is not None:
+            stat.overwritten += 1
+        self.accepted_updates.append(
+            {
+                "stage": candidate.stage,
+                "score": candidate.score,
+                "src_view": candidate.src_view,
+                "src_name": src.name,
+                "src_seg": candidate.src_seg,
+                "dst_view": candidate.dst_view,
+                "dst_name": dst.name,
+                "dst_seg": candidate.dst_seg,
+                "area_score": candidate.area_score,
+                "semantic_score": candidate.semantic_score,
+                "matched_pixels": candidate.matched_pixels,
+                "threshold": threshold,
+                "best_scope": best_scope,
+                "overwrote": previous is not None,
+            }
+        )
+        return True
 
-    mask = None
-    masks = []
-    for i in range(s, 11):
-        mask = np.logical_and(dist < i * dist_base, relative_depth_diff < i * rel_diff_base)
-        masks.append(mask)
-    depth_reprojected[~mask] = 0
-
-    return masks, mask, depth_reprojected, x2d_src, y2d_src, ref_without_b
-    
-def fusion(data_dir):
-    depth_dir = os.path.join(data_dir, 'depths.pt')
-    pose_dir = os.path.join(data_dir, 'poses.pt')
-    intri_dir = os.path.join(data_dir, 'intrinsics.pt')
-    intrinsics, poses = torch.load(intri_dir).detach().cpu().numpy(), torch.load(pose_dir).detach().cpu().numpy()
-    depths = torch.load(depth_dir)
-    
-    for select_view in tqdm(range(num_views)):
-        ref_intrinsics, ref_extrinsics = intrinsics[select_view], np.linalg.inv(poses[select_view])
-        ref_depth_est = depths[select_view].detach().cpu().numpy()
-        src_views = [v for v in range(num_views) if v!=select_view]
-        img_ref_path = os.path.join(img_path, image_name_list[select_view] + '.' + image_lat)
-        
-        all_srcview_depth_ests = []
-        all_srcview_x = []
-        all_srcview_y = []
-        all_srcview_geomask = []
-        ref_without_other = []
-
-        # compute the geometric mask
-        geo_mask_sum = 0
-        dy_range = num_views
-        geo_mask_sums = [0] * (dy_range - s)
-        for src_view in src_views:
-            # camera parameters of the source view
-            src_intrinsics, src_extrinsics = intrinsics[src_view], np.linalg.inv(poses[src_view])
-            img_src_path = os.path.join(img_path, image_name_list[src_view] + '.' + image_lat)
-            # the estimated depth of the source view
-            src_depth_est = depths[src_view].detach().cpu().numpy()
-            masks, geo_mask, depth_reprojected, x2d_src, y2d_src, ref_without = check_geometric_consistency(ref_depth_est, ref_intrinsics,
-                                                                                            ref_extrinsics, src_depth_est,
-                                                                                            src_intrinsics, src_extrinsics)
-            geo_mask_sum += geo_mask.astype(np.int32)
-            for i in range(s, dy_range):
-                geo_mask_sums[i - s] += masks[i - s].astype(np.int32)
-
-            all_srcview_depth_ests.append(depth_reprojected)
-            all_srcview_x.append(x2d_src)
-            all_srcview_y.append(y2d_src)
-            all_srcview_geomask.append(geo_mask)
-            ref_without_other.append(ref_without)
-
-        without_out = np.zeros(ref_without.shape, dtype = bool)
-        for mask_out in ref_without_other:
-            without_out = np.logical_or(mask_out, without_out)
-        without_out = ~without_out
-        if without_out.sum() > 20000:
-            without_out = np.zeros(ref_without.shape, dtype = bool)
-        
-        geo_mask = geo_mask_sum >= dy_range
-        for i in range(s, dy_range):
-            geo_mask = np.logical_or(geo_mask, geo_mask_sums[i - s] >= i)
-
-        final_mask = torch.from_numpy(np.logical_or(geo_mask, without_out))
-        height_in, width_in = final_mask.shape[:2]
-        ratio_height, ratio_width = height / height_in, width / width_in
-        x, y = torch.meshgrid(torch.arange(0, height_in, device=device), torch.arange(0, width_in, device=device))
-        # print(x.shape, x)
-        now_x, now_y = x * ratio_height, y * ratio_width
-        now_x, now_y = now_x.to(torch.long), now_y.to(torch.long)
-        ref_seg, ref_feature, ref_feature_512 = seg_map_list[select_view], language_feature_list[select_view], language_feature_list_512[select_view]
-
-        for ind, src_view in enumerate(src_views):
-            src_mask = all_srcview_geomask[ind]
-            src_view_x, src_view_y = torch.from_numpy(all_srcview_x[ind][src_mask]) * ratio_width, torch.from_numpy(all_srcview_y[ind][src_mask]) * ratio_height
-            src_view_x, src_view_y = src_view_x.to(torch.long).to(device), src_view_y.to(torch.long).to(device)
-
-            if src_view_x.max() > width or src_view_x.min() < 0 or src_view_y.max() > height or src_view_y.min() < 0:
-                # out_region_mask = torch.where(torch.logical_or(src_view_x > width, src_view_x < 0), False, True)
-                out_region_mask_x = torch.where(torch.logical_or(src_view_x > width, src_view_x < 0), False, True)
-                out_region_mask_y = torch.where(torch.logical_or(src_view_y > height, src_view_y < 0), False, True)
-                out_region_mask = torch.logical_and(out_region_mask_x, out_region_mask_y)
-                src_view_x, src_view_y = src_view_x[out_region_mask], src_view_y[out_region_mask]
-                ref_view_x, ref_view_y = now_x[src_mask][out_region_mask], now_y[src_mask][out_region_mask]
-            else:
-                ref_view_x, ref_view_y = now_x[src_mask], now_y[src_mask]
-            src_seg, src_feature, src_feature_512 = seg_map_list[src_view], language_feature_list[src_view], language_feature_list_512[src_view]
-            count_src_ori = Counter(src_seg.reshape(-1).detach().cpu().numpy())
-            count_src_ori.pop(-1, None)
-
-            # print(src_view_x.max(), src_view_x.min())
-            src_ind, ref_ind = src_seg[src_view_y, src_view_x], ref_seg[ref_view_x, ref_view_y]
-            count_ref = Counter(ref_ind.detach().cpu().numpy())
-            count_ref.pop(-1, None)
-            # print(count_ref)
-            for k_ref, v_ref in count_ref.items():
-                ref_bool = (ref_ind == k_ref)
-                ref_f, ref_f_512 = ref_feature[k_ref], ref_feature_512[k_ref]   # reference feature code
-                count_src = Counter(src_ind[ref_bool].detach().cpu().numpy())
-                map_src = torch.cat([src_view_x[:, None], src_view_y[:, None]], dim=1)
-                map_ref = torch.cat([ref_view_y[:, None], ref_view_x[:, None]], dim=1)
-                if -1 in count_src:
-                    count_src.pop(-1, None)
-                if not bool(count_src):
-                    continue
-                # print(get_2_index, map2)
-                max_key = max(count_src, key=lambda k: count_src[k])
-                if count_src[max_key] < fusion_bar:
-                    continue
-                if look_match:
-                    # print(ref_view_y.shape, src_view_y.shape)
-                    # 这里整个取坐标的过程是反的
-                    # print(ref_bool.device, src_view_x.device, map_ref.device, map_src.device)
-                    vis_match_single(img_ref_path, img_src_path, map_ref[ref_bool], map_src[ref_bool], k_ref)
-                
-                whole_pixel_src = count_src_ori[max_key]   # 考察投影的 patch 在整个原来分割 mask 中的占比多少 
-                now_pixel_src = count_src[max_key]
-                pixel_score = now_pixel_src / whole_pixel_src
-                # feature_score = cos_loss(src_feature[max_key], ref_f)
-                feature_score = cos_loss(src_feature_512[max_key], ref_f_512)
-                total_score = lambda_pixel * pixel_score + lambda_feature * feature_score
-
-                if max_key not in fusion_score_list[src_view]:
-                    if total_score > fusion_score_bar:
-                        fusion_score_list[src_view][max_key] = [total_score, select_view, k_ref]
-                        src_feature[max_key] = ref_f
-                        language_feature_list_512[src_view][max_key] = ref_f_512
-                        # print(view_2)
-                elif total_score > fusion_score_list[src_view][max_key][0]:
-                    fusion_score_list[src_view][max_key] = [total_score, select_view, k_ref]
-                    src_feature[max_key] = ref_f
-                    language_feature_list_512[src_view][max_key] = ref_f_512
-
-def roma_match():
-    for view_1, image_name_1 in tqdm(enumerate(image_name_list)):
-        # print('reference_image: {}'.format(image_name_1))
-        language_feature_1, seg_map1, language_feature_1_512 = language_feature_list[view_1], seg_map_list[view_1], language_feature_list_512[view_1]
-        # dino_pca_feature_1 = dino_pca[view_1]
-        # vis_mask(seg_mask=seg_map1, output_filename='seg_map1.png')
-        img1_path = os.path.join(img_path, image_name_1 + '.' + image_lat)
-        count1_ori = Counter(seg_map1.reshape(-1).detach().cpu().numpy())
-        count1_ori.pop(-1, None)
-
-        # for view_2 in range(view_1 + 1, num_views):
-        for view_2 in range(num_views):
-            if view_2 == view_1:
+    def roma_stage(self, level: int) -> None:
+        print("RoMa pixel matching process")
+        for src_view, src in tqdm(list(enumerate(self.views)), desc="roma views"):
+            src_seg = src.seg_maps[level]
+            src_areas = self.segment_area(src_view, level)
+            if not src_areas:
+                self.stats["roma"].skipped_empty += 1
                 continue
-            image_name_2 = image_name_list[view_2]
-            # print('now_image: {}'.format(image_name_2))
-            language_feature_2, seg_map2, language_feature_2_512 = language_feature_list[view_2], seg_map_list[view_2], language_feature_list_512[view_2]
-            # dino_pca_feature_2 = dino_pca[view_2]
-            # vis_mask(seg_mask=seg_map2, output_filename='seg_map2.png')
-
-            img2_path = os.path.join(img_path, image_name_2 + '.' + image_lat)
-            count2_ori = Counter(seg_map2.reshape(-1).detach().cpu().numpy())
-            count2_ori.pop(-1, None)  # a dict describe the number of values in seg_map
-
-            # Match
-            warp, certainty = roma_model.match(img1_path, img2_path, device='cuda')
-            certain_map = (certainty > certain_min)
-            # visual_match(img1_path, img2_path, warp, certainty)
-
-            # get key points that matches img1 and img2
-            # then use certain_map to filter out these low certain value pixels
-            kpts1, kpts2 = roma_model.to_pixel_coordinates(warp, H, W, H, W)  
-            # print(kpts1, dino_pca_feature_2.shape)
-            # exit()
-            kpts1, kpts2 = kpts1[certain_map].to(torch.long), kpts2[certain_map].to(torch.long)
-            # a dict describe the number of values in seg_map
-            if for_debug:
-                certain_map = certain_map.to('cpu')
-                kpts1 = kpts1.to('cpu')
-                kpts2 = kpts2.to('cpu')
-                seg_map2 = seg_map2.to('cpu')
-            # bool 数组作为 index 作用返回得是一维向量
-            count1, count2 = Counter(seg_map1[certain_map].detach().cpu().numpy()), Counter(seg_map2[certain_map].detach().cpu().numpy())
-            if -1 in count1:
-                count1.pop(-1, None)
-            if -1 in count2:
-                count2.pop(-1, None)
-            
-            # let feature map 1 be a standard, project feature map 2's corresponding feature to feature map 1
-            lens = 0
-            for k1, v1 in count1.items():
-                lens += 1
-                # print(lens, k1, v1)
-                now_bool = (seg_map1[certain_map] == k1)  # 有问题，seg_map2 针对地是全图坐标，这里地 kpts2 是匹配点地所有位置，根本不对，要改成 segmap1
-                map1, map2 = kpts1[now_bool], kpts2[now_bool]
-                # dino1, dino2 = dino_pca_feature_1[map1[:, 1], map1[:, 0], :], dino_pca_feature_2[map2[:, 1], map2[:, 0], :]
-                # TODO: 接下来需要将 dino2 的映射到的区域取出来，然后将 dino1 和 dino2 的对应区域做 loss 得到新衡量指标
-                nowfeature_1, nowfeature_1_512 = language_feature_1[k1], language_feature_1_512[k1]
-                # get_1_index = seg_map1.reshape(H, W)[map1[:, 0], map1[:, 1]]
-                get_2_index = seg_map2[map2[:, 1], map2[:, 0]]
-                count_now_2 = Counter(get_2_index.detach().cpu().numpy())
-                if -1 in count_now_2:
-                    count_now_2.pop(-1, None)
-                if not count_now_2:
+            for dst_view, dst in enumerate(self.views):
+                if dst_view == src_view:
                     continue
-                # print(get_2_index, map2)
-                max_key = max(count_now_2, key=lambda k: count_now_2[k])
-                bool_max2 = (get_2_index == max_key)
-                # dino1, dino2 = dino1[bool_max2], dino2[bool_max2]
-                # print(dino1.shape, max(torch.norm(abs(dino2 - dino1), dim=1)), abs(dino2 - dino1).shape, count_now_2[max_key])
-                if count_now_2[max_key] < patch_bar:
+                dst_seg = dst.seg_maps[level]
+                dst_areas = self.segment_area(dst_view, level)
+                if not dst_areas:
+                    self.stats["roma"].skipped_empty += 1
                     continue
-                if look_match:
-                    vis_match_single(img1_path, img2_path, map1, map2, k1)
-                
-                whole_pixel_2 = count2_ori[max_key]   # 考察投影的 patch 在整个原来分割 mask 中的占比多少 
-                now_pixel_2 = count2[max_key]
-                pixel_score = now_pixel_2 / whole_pixel_2
-                # dino_score = - torch.sum(torch.norm(dino2 - dino1, dim=1)) / int(dino1.shape[0])
-                # print(dino_score, now_pixel_2, whole_pixel_2, dino1.shape, dino2.shape)
-                feature_score = cos_loss(language_feature_2[max_key], nowfeature_1)
-                # feature_score = cos_loss(language_feature_2_512[max_key], nowfeature_1_512)
-                total_score = lambda_pixel * pixel_score + lambda_feature * feature_score
-                # total_score = lambda_pixel * pixel_score + lambda_feature * feature_score
-                # if match_loss > match_bar_cos:
-                #     # seg_map2 = torch.where(seg_map2 == max_key, k1, seg_map2)
-                #     language_feature_2[max_key] = nowfeature_1
+                warp, certainty = self.matcher_model.match(
+                    str(src.image_path),
+                    str(dst.image_path),
+                    device=str(self.device),
+                )
+                certain = certainty > self.config.certainty_threshold
+                if int(certain.sum().item()) == 0:
+                    self.stats["roma"].skipped_empty += 1
+                    continue
+                legacy_src_labels = None
+                legacy_dst_counter = None
+                if self.config.scoring == "legacy":
+                    # The original script grouped source masks by seg_map[certain]
+                    # and scored target coverage by seg_map2[certain], rather than
+                    # by the RoMa-projected target coordinates. Keep that path for
+                    # reproducibility; --scoring paper uses the corrected geometry.
+                    legacy_src_labels = src_seg[certain]
+                    legacy_dst_counter = valid_counter(dst_seg[certain])
+                kpts_src, kpts_dst = self.matcher_model.to_pixel_coordinates(
+                    warp,
+                    self.matcher_height,
+                    self.matcher_width,
+                    self.matcher_height,
+                    self.matcher_width,
+                )
+                kpts_src = kpts_src[certain].long()
+                kpts_dst = kpts_dst[certain].long()
+                valid = (
+                    (kpts_src[:, 0] >= 0)
+                    & (kpts_src[:, 0] < self.width)
+                    & (kpts_src[:, 1] >= 0)
+                    & (kpts_src[:, 1] < self.height)
+                    & (kpts_dst[:, 0] >= 0)
+                    & (kpts_dst[:, 0] < self.width)
+                    & (kpts_dst[:, 1] >= 0)
+                    & (kpts_dst[:, 1] < self.height)
+                )
+                if int(valid.sum().item()) == 0:
+                    self.stats["roma"].skipped_oob += 1
+                    continue
+                kpts_src = kpts_src[valid]
+                kpts_dst = kpts_dst[valid]
+                if self.config.scoring == "legacy" and legacy_src_labels is not None:
+                    src_labels = legacy_src_labels[valid]
+                else:
+                    src_labels = src_seg[kpts_src[:, 1], kpts_src[:, 0]]
+                dst_labels = dst_seg[kpts_dst[:, 1], kpts_dst[:, 0]]
+                src_counter = valid_counter(src_labels)
 
-                if max_key not in dict_score_list[view_2]:
-                    if total_score > total_score_bar:
-                        dict_score_list[view_2][max_key] = [total_score, view_1, k1]
-                        big_mask_collision[view_2][max_key] = []
-                        language_feature_2[max_key] = nowfeature_1
-                        language_feature_list_512[view_2][max_key] = nowfeature_1_512
-                        # print(view_2)
-                elif total_score > dict_score_list[view_2][max_key][0]:
-                    dict_score_list[view_2][max_key] = [total_score, view_1, k1]
-                    language_feature_2[max_key] = nowfeature_1
-                    language_feature_list_512[view_2][max_key] = nowfeature_1_512
-                if total_score > 2 * total_score_bar:
-                    if pixel_score > area_bar:
-                        big_mask_collision[view_2][max_key].append([total_score, view_1, k1])
-            # exit()
+                for src_id in src_counter:
+                    in_src = src_labels == src_id
+                    dst_counter = valid_counter(dst_labels[in_src])
+                    dst_id = majority_key(dst_counter)
+                    if dst_id is None:
+                        self.stats["roma"].skipped_empty += 1
+                        continue
+                    matched_pixels = int(dst_counter[dst_id])
+                    if matched_pixels < self.config.min_roma_pixels:
+                        self.stats["roma"].skipped_small += 1
+                        continue
+                    dst_area = max(1, int(dst_areas.get(dst_id, 1)))
+                    if self.config.scoring == "legacy":
+                        area_score = min(1.0, int((legacy_dst_counter or {}).get(dst_id, 0)) / dst_area)
+                    else:
+                        area_score = min(1.0, matched_pixels / dst_area)
+                    semantic_score = self.segment_similarity(
+                        src_view,
+                        src_id,
+                        dst_view,
+                        dst_id,
+                        self.config.roma_similarity_space,
+                    )
+                    total = self.score(area_score, semantic_score)
+                    candidate = Candidate(
+                        score=total,
+                        src_view=src_view,
+                        src_seg=src_id,
+                        dst_view=dst_view,
+                        dst_seg=dst_id,
+                        area_score=area_score,
+                        semantic_score=semantic_score,
+                        matched_pixels=matched_pixels,
+                        stage="roma",
+                    )
+                    self.stats["roma"].proposals += 1
+                    self.apply_candidate(candidate, self.config.match_threshold, "roma")
+                    if (
+                        total > 2.0 * self.config.match_threshold
+                        and area_score > self.config.fusion_area_threshold
+                    ):
+                        self.mask_collision[dst_view][dst_id].append(candidate)
 
-def mask_fusion(num_views, big_mask_collision):
-    for view in range(num_views):
-        now_collision = big_mask_collision[view]
-        feature_a = language_feature_list[view]
-        for key in now_collision:
-            for _, view_1, key1 in now_collision[key]:
-                language_feature_list[view_1][key1] = feature_a[key]
+                    if self.config.visualize:
+                        dst_match = dst_labels == dst_id
+                        keep = in_src & dst_match
+                        if int(keep.sum().item()) > 0:
+                            save_match_visual(
+                                src.image_path,
+                                dst.image_path,
+                                kpts_src[keep],
+                                kpts_dst[keep],
+                                self.height,
+                                self.width,
+                                Path(self.config.save_path),
+                                f"roma_l{level}_v{src_view}_{src_id}_to_v{dst_view}_{dst_id}",
+                                self.device,
+                            )
+
+    def should_run_mask_fusion(self, level: int) -> bool:
+        if self.config.mask_fusion == "on":
+            return True
+        if self.config.mask_fusion == "off":
+            return False
+        return level >= 2
+
+    def mask_fusion_stage(self, level: int) -> None:
+        print("inconsistent mask fusion process")
+        if not self.should_run_mask_fusion(level):
+            return
+        for dst_view, per_seg in self.mask_collision.items():
+            dst_features = self.views[dst_view]
+            for dst_seg, candidates in per_seg.items():
+                dst_feat3 = safe_index_feature(dst_features.feat3, dst_seg)
+                dst_feat512 = safe_index_feature(dst_features.feat512, dst_seg)
+                if dst_feat3 is None or dst_feat512 is None:
+                    continue
+                for candidate in candidates:
+                    src_features = self.views[candidate.src_view]
+                    if candidate.src_seg >= src_features.feat3.shape[0]:
+                        continue
+                    src_features.feat3[candidate.src_seg] = dst_feat3
+                    src_features.feat512[candidate.src_seg] = dst_feat512
+                    self.stats["mask_fusion"].mask_fusions += 1
+                    self.accepted_updates.append(
+                        {
+                            "stage": "mask_fusion",
+                            "score": candidate.score,
+                            "src_view": dst_view,
+                            "src_name": dst_features.name,
+                            "src_seg": dst_seg,
+                            "dst_view": candidate.src_view,
+                            "dst_name": src_features.name,
+                            "dst_seg": candidate.src_seg,
+                            "area_score": candidate.area_score,
+                            "semantic_score": candidate.semantic_score,
+                            "matched_pixels": candidate.matched_pixels,
+                            "threshold": None,
+                            "best_scope": "mask_fusion",
+                            "overwrote": True,
+                        }
+                    )
+
+    def reprojection_stage(self, level: int) -> None:
+        print("depth reprojection matching process")
+        intrinsics = torch.load(self.camera_dir / "intrinsics.pt", map_location="cpu").detach().cpu().numpy()
+        poses = torch.load(self.camera_dir / "poses.pt", map_location="cpu").detach().cpu().numpy()
+        depths_t = torch.load(self.camera_dir / "depths.pt", map_location="cpu")
+        if isinstance(depths_t, torch.Tensor):
+            depths = depths_t.detach().cpu().numpy()
+        else:
+            depths = [
+                depth.detach().cpu().numpy() if isinstance(depth, torch.Tensor) else np.asarray(depth)
+                for depth in depths_t
+            ]
+        n_loaded = min(len(self.views), len(depths), len(intrinsics), len(poses))
+        if n_loaded != len(self.views):
+            print(f"[WARN] Camera/depth count {n_loaded} differs from image count {len(self.views)}")
+
+        for ref_view in tqdm(range(n_loaded), desc="reprojection views"):
+            ref_seg = self.views[ref_view].seg_maps[level]
+            ref_intr = intrinsics[ref_view]
+            ref_extr = np.linalg.inv(poses[ref_view])
+            ref_depth = depths[ref_view]
+            for dst_view in range(n_loaded):
+                if dst_view == ref_view:
+                    continue
+                dst_intr = intrinsics[dst_view]
+                dst_extr = np.linalg.inv(poses[dst_view])
+                dst_depth = depths[dst_view]
+                geom = self.geometric_correspondences(
+                    ref_depth,
+                    ref_intr,
+                    ref_extr,
+                    dst_depth,
+                    dst_intr,
+                    dst_extr,
+                )
+                if geom is None:
+                    self.stats["reproject"].skipped_empty += 1
+                    continue
+                ref_y, ref_x, dst_y, dst_x = geom
+                dst_seg = self.views[dst_view].seg_maps[level]
+                ref_labels = ref_seg[ref_y, ref_x]
+                dst_labels = dst_seg[dst_y, dst_x]
+                ref_counter = valid_counter(ref_labels)
+                dst_areas = self.segment_area(dst_view, level)
+                for ref_id in ref_counter:
+                    in_ref = ref_labels == ref_id
+                    dst_counter = valid_counter(dst_labels[in_ref])
+                    dst_id = majority_key(dst_counter)
+                    if dst_id is None:
+                        self.stats["reproject"].skipped_empty += 1
+                        continue
+                    matched_pixels = int(dst_counter[dst_id])
+                    if matched_pixels < self.config.min_reproject_pixels:
+                        self.stats["reproject"].skipped_small += 1
+                        continue
+                    dst_area = max(1, int(dst_areas.get(dst_id, 1)))
+                    area_score = min(1.0, matched_pixels / dst_area)
+                    semantic_score = self.segment_similarity(
+                        ref_view,
+                        ref_id,
+                        dst_view,
+                        dst_id,
+                        self.config.reproject_similarity_space,
+                    )
+                    total = self.score(area_score, semantic_score)
+                    candidate = Candidate(
+                        score=total,
+                        src_view=ref_view,
+                        src_seg=ref_id,
+                        dst_view=dst_view,
+                        dst_seg=dst_id,
+                        area_score=area_score,
+                        semantic_score=semantic_score,
+                        matched_pixels=matched_pixels,
+                        stage="reproject",
+                    )
+                    self.stats["reproject"].proposals += 1
+                    self.apply_candidate(candidate, self.config.reproject_threshold, "reproject")
+
+    def geometric_correspondences(
+        self,
+        depth_ref: np.ndarray,
+        intr_ref: np.ndarray,
+        extr_ref: np.ndarray,
+        depth_dst: np.ndarray,
+        intr_dst: np.ndarray,
+        extr_dst: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        h0, w0 = depth_ref.shape[:2]
+        cols, rows = np.meshgrid(np.arange(w0), np.arange(h0))
+        flat_cols = cols.reshape(-1)
+        flat_rows = rows.reshape(-1)
+        flat_depth = depth_ref.reshape(-1)
+        valid_ref = flat_depth > 0
+        if not np.any(valid_ref):
+            return None
+
+        pix = np.vstack((flat_cols, flat_rows, np.ones_like(flat_cols)))
+        xyz_ref = np.linalg.inv(intr_ref) @ (pix * flat_depth.reshape(1, -1))
+        xyz_dst = (extr_dst @ np.linalg.inv(extr_ref) @ np.vstack((xyz_ref, np.ones_like(flat_cols))))[:3]
+        z_dst = xyz_dst[2]
+        valid_z = z_dst > 1e-8
+        projected = intr_dst @ xyz_dst
+        projected[:2] /= np.maximum(projected[2:3], 1e-8)
+        dst_x = projected[0].reshape(h0, w0).astype(np.float32)
+        dst_y = projected[1].reshape(h0, w0).astype(np.float32)
+
+        sampled_dst_depth = cv2.remap(
+            depth_dst.astype(np.float32),
+            dst_x,
+            dst_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        sampled_flat = sampled_dst_depth.reshape(-1)
+        xyz_dst_sampled = np.linalg.inv(intr_dst) @ (projected * sampled_flat.reshape(1, -1))
+        xyz_ref_back = (extr_ref @ np.linalg.inv(extr_dst) @ np.vstack((xyz_dst_sampled, np.ones_like(flat_cols))))[:3]
+        projected_back = intr_ref @ xyz_ref_back
+        projected_back[:2] /= np.maximum(projected_back[2:3], 1e-8)
+        back_x = projected_back[0].reshape(h0, w0)
+        back_y = projected_back[1].reshape(h0, w0)
+        back_depth = xyz_ref_back[2].reshape(h0, w0)
+
+        dist = np.sqrt((back_x - cols) ** 2 + (back_y - rows) ** 2)
+        rel_depth = np.abs(back_depth - depth_ref) / np.maximum(depth_ref, 1e-8)
+        valid = valid_ref.reshape(h0, w0) & valid_z.reshape(h0, w0) & (sampled_dst_depth > 0)
+
+        mask = np.zeros((h0, w0), dtype=bool)
+        max_votes = max(self.config.geom_start + 1, len(self.views))
+        for i in range(self.config.geom_start, max_votes + 1):
+            mask |= (
+                valid
+                & (dist < i * self.config.geom_dist_base)
+                & (rel_depth < i * self.config.geom_rel_diff_base)
+            )
+        if not np.any(mask):
+            return None
+
+        ref_rows, ref_cols = np.nonzero(mask)
+        scale_y = self.height / h0
+        scale_x = self.width / w0
+        src_x = np.floor(dst_x[mask] * scale_x).astype(np.int64)
+        src_y = np.floor(dst_y[mask] * scale_y).astype(np.int64)
+        ref_x = np.floor(ref_cols * scale_x).astype(np.int64)
+        ref_y = np.floor(ref_rows * scale_y).astype(np.int64)
+        in_bounds = (
+            (src_x >= 0)
+            & (src_x < self.width)
+            & (src_y >= 0)
+            & (src_y < self.height)
+            & (ref_x >= 0)
+            & (ref_x < self.width)
+            & (ref_y >= 0)
+            & (ref_y < self.height)
+        )
+        if not np.any(in_bounds):
+            return None
+        return (
+            torch.from_numpy(ref_y[in_bounds]).long().to(self.device),
+            torch.from_numpy(ref_x[in_bounds]).long().to(self.device),
+            torch.from_numpy(src_y[in_bounds]).long().to(self.device),
+            torch.from_numpy(src_x[in_bounds]).long().to(self.device),
+        )
+
+    def visualize_level(self, level: int) -> None:
+        for view in self.views:
+            save_feature_visualization(
+                self.feat3_dir,
+                view.name,
+                level,
+                self.height,
+                self.width,
+                self.look_dir / f"level_{level}",
+            )
+
+    def save_features(self) -> None:
+        for view in self.views:
+            np.save(self.feat3_dir / f"{view.name}_f.npy", view.feat3.detach().cpu().numpy())
+            np.save(self.feat512_dir / f"{view.name}_f.npy", view.feat512.detach().cpu().numpy())
+
+    def save_snapshot(self, level: int, stage: str) -> None:
+        if not self.config.snapshot_dir:
+            return
+        snapshot_root = Path(self.config.snapshot_dir) / f"level_{level}" / stage
+        dim3_dir = snapshot_root / "language_features_dim3"
+        dim512_dir = snapshot_root / "language_features"
+        dim3_dir.mkdir(parents=True, exist_ok=True)
+        dim512_dir.mkdir(parents=True, exist_ok=True)
+        for view in self.views:
+            np.save(dim3_dir / f"{view.name}_f.npy", view.feat3.detach().cpu().numpy())
+            np.save(dim512_dir / f"{view.name}_f.npy", view.feat512.detach().cpu().numpy())
+
+    def summary(self) -> dict:
+        return {
+            "timestamp": time.strftime("%Y%m%d_%H%M%S", time.localtime()),
+            "data_root": str(self.data_root),
+            "config": asdict(self.config),
+            "num_views": len(self.views),
+            "image_size": [self.height, self.width],
+            "stats": {stage: asdict(stats) for stage, stats in sorted(self.stats.items())},
+            "accepted_updates": self.accepted_updates,
+        }
 
 
-from argparse import ArgumentParser
-parser = ArgumentParser(description="prompt any label")
-parser.add_argument('--dataname', type=str, required=True)
-parser.add_argument('--feature_level', type=int, default=2)
-parser.add_argument('--n_views', type=int, default=None)
-parser.add_argument('--refresh_origin', action='store_true')
-parser.add_argument('--no_visualization', action='store_true')
-parser.add_argument("--save_path", default="./data/match_results", type=str)
-args, _ = parser.parse_known_args()
-dataname = args.dataname
-feature_level = args.feature_level
-
-if args.n_views is not None:
-    n_view = args.n_views
-else:
-    n_view = 4
-    if dataname not in ['teatime', 'ramen', 'waldo_kitchen', 'figurines']:
-        n_view = 3
-img_path = './data/{}/dust3r_{}_views/images'.format(dataname, n_view)
-camera_path = './data/{}/dust3r_{}_views/sparse/0/'.format(dataname, n_view)
-# dino_path = './data/{}/dino_feature/fit_3d'.format(dataname)
-imgs = os.listdir(img_path)
-img0 = cv2.imread(os.path.join(img_path, imgs[0]))
-ori_height, ori_width = img0.shape[:2]
-# exit()
-WARNED = False
-if ori_height > 1080:
-    if not WARNED:
-        print("[ INFO ] Encountered quite large input images (>1080P), rescaling to 1080P.\n "
-            "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-        WARNED = True
-    global_down = ori_height / 1080
-else:
-    global_down = 1
-
-height, width = int(ori_height / global_down), int(ori_width / global_down)
-# test_views = [1, 4, 6]
-test_views = []
-image_name_list = sorted([name.split('.', 1)[0] for name in imgs])
-image_name_list = [name for idx, name in enumerate(image_name_list) if idx not in test_views]
-image_lat = imgs[0].split('.', 1)[1]
-
-lf_path_512 = './data/{}/dust3r_{}_views/language_features'.format(dataname, n_view)
-lf_path = './data/{}/dust3r_{}_views/language_features_dim3'.format(dataname, n_view)
-npy_dir_look = './data/{}/dust3r_{}_views/language_features_look'.format(dataname,n_view)
-npy_dir_new = './data/{}/dust3r_{}_views/language_feature_renew_look'.format(dataname,n_view)
-
-num_views = len(image_name_list)
-# Create model
-# roma_model = roma_outdoor(device=device, coarse_res=560, upsample_res=(730, 988))
-roma_model = roma_indoor(device='cuda', coarse_res=560, upsample_res=(height, width))
-H, W = roma_model.get_output_resolution()
-for_debug = False
-look_match = False
-look_feature = not args.no_visualization
-# big_mask_fusion = True
-big_mask_fusion = False
-
-# # for 3d_ovs
-# area_bar = 0.1
-# total_score_bar = 0.15
-# fusion_score_bar = 0.1
-# certain_min = 0.1
-# lambda_pixel = 0.7
-# lambda_feature = 0.3
-# patch_bar = 150
-# fusion_bar = 80
-# s = 1
-# times = 3
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# # for lerf_ovs 
-# feature_level = 2
-# area_bar = 0.15
-# total_score_bar = 0.2
-# fusion_score_bar = 0.25
-# certain_min = 0.20
-# lambda_pixel = 0.7
-# # lambda_dino = 0
-# lambda_feature = 0.3
-# patch_bar = 150
-# fusion_bar = 100
-# s = 1
-# times = 2
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# teatime feature_level = 3
-# area_bar = 0.15
-# total_score_bar = 0.2
-# fusion_score_bar = 0.3
-# certain_min = 0.2
-# lambda_pixel = 0.7
-# # lambda_dino = 0.1
-# lambda_feature = 0.3
-# patch_bar = 180
-# fusion_bar = 180
-# s = 1
-# times = 1.5
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# feature_level = 2
-# area_bar = 0.15
-# total_score_bar = 0.2
-# fusion_score_bar = 0.25
-# certain_min = 0.2
-# lambda_pixel = 0.7
-# # lambda_dino = 0
-# lambda_feature = 0.3
-# patch_bar = 170
-# fusion_bar = 120
-# s = 1
-# times = 1.5
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# # figurines feature_level = 3
-# area_bar = 0.15
-# total_score_bar = 0.15
-# fusion_score_bar = 0.2
-# certain_min = 0.17
-# lambda_pixel = 0.7
-# lambda_feature = 0.3
-# patch_bar = 120
-# fusion_bar = 170
-# s = 1
-# times = 4
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# Default fusion thresholds. Override feature_level from CLI instead of
-# hard-coding one scene-specific setting here.
-area_bar = 0.3
-total_score_bar = 0.5
-fusion_score_bar = 0.5
-certain_min = 0.35
-lambda_pixel = 0.7
-lambda_feature = 0.3
-patch_bar = 150
-fusion_bar = 150
-s = 1
-times = 1.5
-dist_base = 1/8 * times
-rel_diff_base = 1/10 * times
-
-# feature_level = 3
-# area_bar = 0.3
-# total_score_bar = 0.5
-# fusion_score_bar = 0.5
-# certain_min = 0.4
-# lambda_pixel = 0.7
-# lambda_feature = 0.3
-# patch_bar = 150
-# fusion_bar = 150
-# s = 1
-# times = 1.5
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-# FOR 3D-OVS
-# feature_level = 2
-# area_bar = 0.3
-# total_score_bar = 0.5
-# fusion_score_bar = 0.5
-# certain_min = 0.3
-# lambda_pixel = 0.7
-# lambda_feature = 0.3
-# patch_bar = 150
-# fusion_bar = 150
-# s = 1
-# times = 1.5
-# dist_base = 1/8 * times
-# rel_diff_base = 1/10 * times
-
-if feature_level in [2, 3]:
-    big_mask_fusion = True
-# big_mask_fusion = False
-
-save_path = os.path.join(args.save_path, 'match.jpg')
-
-language_feature_list, language_feature_list_512, seg_map_list = [], [], []
-# dino_pca = []
-dict_score_list = []
-fusion_score_list = []
-big_mask_collision = []
-
-origin_path = ['./data/{}/dust3r_{}_views/language_features_origin'.format(dataname, n_view), './data/{}/dust3r_{}_views/language_features_origin_dim3'.format(dataname, n_view)]
-move_folder(origin_path[0], lf_path_512, refresh=args.refresh_origin)
-move_folder(origin_path[1], lf_path, refresh=args.refresh_origin)
-
-for image_name in image_name_list:
-    language_feature, seg_map = get_language_feature(origin_path[1], feature_level, height, width, image_name)
-    language_feature_512, _ = get_language_feature(origin_path[0], feature_level, height, width, image_name)
-    language_feature_list.append(language_feature)
-    language_feature_list_512.append(language_feature_512)
-    # dino_pca.append(torch.from_numpy(cv2.imread(os.path.join(dino_path, image_name + '.' + image_lat))))
-    # im = Image.open(os.path.join(dino_path, image_name + '.' + image_lat)).resize((W, H))
-    # dino_pca.append((torch.tensor(np.array(im)) / 255).to(device))
-    seg_map_list.append(seg_map)
-    dict_score_list.append(dict())
-    fusion_score_list.append(dict())
-    big_mask_collision.append(dict())
-
-print('Roma feature matching process')
-roma_match()
-
-for now_view, image_name in enumerate(image_name_list):
-    if big_mask_fusion:
-        fusion_delete(now_view)
-    if look_feature:
-        language_feature, seg_map = language_feature_list[now_view], seg_map_list[now_view]
-        get_language_feature_old(origin_path[1], feature_level, height, width, image_name)
-        np.save(os.path.join(lf_path, image_name + '_f.npy'), language_feature.detach().cpu().numpy())
-        vis_language_feature_new(lf_path, image_name, height, width, os.path.join(npy_dir_new, 'before_fusion'))
-        if big_mask_collision[now_view]:
-            for key in big_mask_collision[now_view]:
-                now_msk = big_mask_collision[now_view][key]
+def build_config(args: argparse.Namespace) -> FusionConfig:
+    n_views = infer_n_views(args.dataname, args.n_views)
+    levels = parse_levels(args)
+    dist_base = args.geom_dist_base
+    rel_diff_base = args.geom_rel_diff_base
+    if dist_base is None:
+        dist_base = 0.125 * args.geom_times
+    if rel_diff_base is None:
+        rel_diff_base = 0.1 * args.geom_times
+    return FusionConfig(
+        dataname=args.dataname,
+        n_views=n_views,
+        feature_levels=levels,
+        device=args.device,
+        matcher=args.matcher,
+        coarse_res=args.coarse_res,
+        match_threshold=args.match_threshold,
+        reproject_threshold=args.reproject_threshold,
+        semantic_weight=args.semantic_weight,
+        fusion_area_threshold=args.fusion_area_threshold,
+        certainty_threshold=args.certainty_threshold,
+        min_roma_pixels=args.min_roma_pixels,
+        min_reproject_pixels=args.min_reproject_pixels,
+        geom_start=args.geom_start,
+        geom_times=args.geom_times,
+        geom_dist_base=dist_base,
+        geom_rel_diff_base=rel_diff_base,
+        mask_fusion=args.mask_fusion,
+        roma_similarity_space=args.roma_similarity_space,
+        reproject_similarity_space=args.reproject_similarity_space,
+        scoring=args.scoring,
+        refresh_origin=args.refresh_origin,
+        visualize=not args.no_visualization,
+        save_path=args.save_path,
+        stats_path=args.stats_path,
+        snapshot_dir=args.snapshot_dir,
+        dry_run=args.dry_run,
+    )
 
 
-print('big mask fusion process')
-if big_mask_fusion:
-    mask_fusion(num_views, big_mask_collision)
-    if look_feature:
-        for now_view, image_name in enumerate(image_name_list):
-            language_feature, seg_map = language_feature_list[now_view], seg_map_list[now_view]
-            np.save(os.path.join(lf_path, image_name + '_f.npy'), language_feature.detach().cpu().numpy())
-            vis_language_feature_new(lf_path, image_name, height, width, os.path.join(npy_dir_new, 'after_big_maskfusion'))
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Multi-view semantic feature alignment using RoMa and depth reprojection."
+    )
+    parser.add_argument("--dataname", required=True)
+    parser.add_argument("--n_views", type=int, default=None)
+    parser.add_argument("--feature_level", type=int, default=2)
+    parser.add_argument(
+        "--feature_levels",
+        default="",
+        help="Optional comma/space separated levels. Overrides --feature_level, e.g. 1,2,3.",
+    )
+    parser.add_argument("--refresh_origin", action="store_true")
+    parser.add_argument("--no_visualization", action="store_true")
+    parser.add_argument("--save_path", default="./data/match_results")
+    parser.add_argument("--stats_path", default="")
+    parser.add_argument("--dry_run", action="store_true")
 
-print('depth feature fusion process')
-fusion(camera_path)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--matcher", choices=["roma_indoor", "roma_outdoor"], default="roma_indoor")
+    parser.add_argument("--coarse_res", type=int, default=560)
+    parser.add_argument(
+        "--similarity_space",
+        choices=["high", "low"],
+        default=None,
+        help="Compatibility alias. Sets both RoMa and reprojection similarity spaces.",
+    )
+    parser.add_argument("--roma_similarity_space", choices=["high", "low"], default="low")
+    parser.add_argument("--reproject_similarity_space", choices=["high", "low"], default="high")
+    parser.add_argument("--scoring", choices=["paper", "legacy"], default="legacy")
+    parser.add_argument("--mask_fusion", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument("--snapshot_dir", default="")
 
-if look_feature:
-    for now_view, image_name in enumerate(image_name_list):
-        language_feature, seg_map = language_feature_list[now_view], seg_map_list[now_view]
-        np.save(os.path.join(lf_path, image_name + '_f.npy'), language_feature.detach().cpu().numpy())
-        vis_language_feature_new(lf_path, image_name, height, width, os.path.join(npy_dir_new, 'after_fusion'))
+    parser.add_argument("--match_threshold", type=float, default=0.5)
+    parser.add_argument("--reproject_threshold", type=float, default=0.5)
+    parser.add_argument("--semantic_weight", type=float, default=0.3)
+    parser.add_argument("--fusion_area_threshold", type=float, default=0.3)
+    parser.add_argument("--certainty_threshold", type=float, default=0.35)
+    parser.add_argument("--min_roma_pixels", type=int, default=150)
+    parser.add_argument("--min_reproject_pixels", type=int, default=150)
+    parser.add_argument("--geom_start", type=int, default=1)
+    parser.add_argument("--geom_times", type=float, default=1.5)
+    parser.add_argument("--geom_dist_base", type=float, default=None)
+    parser.add_argument("--geom_rel_diff_base", type=float, default=None)
+    return parser
 
-for now_view, image_name in enumerate(image_name_list):
-    language_feature = language_feature_list[now_view]
-    language_feature_512 = language_feature_list_512[now_view]
-    np.save(os.path.join(lf_path, image_name + '_f.npy'), language_feature.detach().cpu().numpy())
-    np.save(os.path.join(lf_path_512, image_name + '_f.npy'), language_feature_512.detach().cpu().numpy())
+
+def main() -> None:
+    args = make_parser().parse_args()
+    if args.similarity_space is not None:
+        args.roma_similarity_space = args.similarity_space
+        args.reproject_similarity_space = args.similarity_space
+    if not args.stats_path:
+        args.stats_path = None
+    if not args.snapshot_dir:
+        args.snapshot_dir = None
+    config = build_config(args)
+    SemanticFusion(config).run()
+
+
+if __name__ == "__main__":
+    main()

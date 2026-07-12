@@ -19,7 +19,6 @@ from utils.dust3r_utils import  compute_global_alignment, load_images, storePly,
 def get_args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_size", type=int, default=512, choices=[512, 224], help="image size")
-    # parser.add_argument("--model_path", type=str, default="./checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth", help="path to the model weights")
     parser.add_argument("--model_path", type=str, default="./ckpt/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth", help="path to the model weights")
     parser.add_argument("--device", type=str, default='cuda', help="pytorch device")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -27,17 +26,15 @@ def get_args_parser():
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--niter", type=int, default=300)
     parser.add_argument("--focal_avg", action="store_true")
-    # parser.add_argument("--focal_avg", type=bool, default=True)
 
     parser.add_argument("--llffhold", type=int, default=0)
     parser.add_argument("--n_views", type=int, default=12)
-    # parser.add_argument("--img_base_path", type=str, default="/home/workspace/datasets/instantsplat/Tanks_dust3r/Barn/24_views")
-    parser.add_argument("--img_base_path", type=str, default="/home/hu997372/code/sparselgs/data/lerf_teatime")
+    parser.add_argument("--img_base_path", type=str, required=True)
 
     return parser
 
 if __name__ == '__main__':
-    
+
     parser = get_args_parser()
     args = parser.parse_args()
 
@@ -53,26 +50,26 @@ if __name__ == '__main__':
     os.makedirs(img_folder_path, exist_ok=True)
     model = AsymmetricCroCo3DStereo.from_pretrained(model_path).to(device)
     ##########################################################################################################################################################################################
-    
+
     train_img_list = sorted(os.listdir(os.path.join(img_base_path, "images")))
     if args.llffhold > 0:
         train_img_list = [c for idx, c in enumerate(train_img_list) if (idx+1) % args.llffhold != 0]
-    
+
     # sample sparse view
     indices = np.linspace(0, len(train_img_list) - 1, n_views, dtype=int)
     print(indices)
     tmp_img_list = [train_img_list[i] for i in indices]
     train_img_list = tmp_img_list
-    
+
     assert len(train_img_list)==n_views, f"Number of images in the folder is not equal to {n_views}"
-    
+
     if len(os.listdir(img_folder_path)) != len(train_img_list):
         for img_name in train_img_list:
             src_path = os.path.join(img_base_path, "images", img_name)
             tgt_path = os.path.join(img_folder_path, img_name)
             print(src_path, tgt_path)
             shutil.copy(src_path, tgt_path)
-    images, ori_size = load_images(img_folder_path, size=512) 
+    images, ori_size = load_images(img_folder_path, size=512)
     print("ori_size", ori_size)
 
     start_time = time.time()
@@ -84,7 +81,7 @@ if __name__ == '__main__':
 
     scene = global_aligner(output, device=args.device, mode=GlobalAlignerMode.PointCloudOptimizer)
     loss = compute_global_alignment(scene=scene, init="mst", niter=niter, schedule=schedule, lr=lr, focal_avg=args.focal_avg)
-    scene = scene.clean_pointcloud()   
+    scene = scene.clean_pointcloud()
 
     imgs = to_numpy(scene.imgs)
     focals = scene.get_focals()
@@ -112,5 +109,5 @@ if __name__ == '__main__':
     np.save(output_colmap_path + "/focal.npy", np.array(focals.cpu()))
 
     torch.save(K0, f'{output_colmap_path}/intrinsics.pt')
-    torch.save(scene.get_im_poses(), f'{output_colmap_path}/poses.pt')  
+    torch.save(scene.get_im_poses(), f'{output_colmap_path}/poses.pt')
     torch.save(depths, f'{output_colmap_path}/depths.pt')

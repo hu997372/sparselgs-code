@@ -46,6 +46,8 @@ def render_set(model_path, source_path, name, iteration, views, gaussians, pipel
 
         if not args.include_feature:
             gt = view.original_image[0:3, :, :]
+        elif args.skip_feature_gt:
+            gt = torch.zeros_like(rendering)
         else:
             gt, mask = view.get_language_feature(os.path.join(source_path, args.language_features_name), feature_level=args.feature_level)
 
@@ -141,12 +143,14 @@ def render_set_optimize(model_path, source_path, name, iteration, views, gaussia
             rendering_opt = render(view, gaussians, pipeline, background, args, camera_pose=opt_pose)["render"]
         else:
             rendering_opt = render(view, gaussians, pipeline, background, args, camera_pose=opt_pose)["language_feature_image"]
-            
+
         if not args.include_feature:
             gt = view.original_image[0:3, :, :]
+        elif args.skip_feature_gt:
+            gt = torch.zeros_like(rendering_opt)
         else:
             gt, mask = view.get_language_feature(os.path.join(source_path, args.language_features_name), feature_level=args.feature_level)
-        
+
         rendering_opt = rendering_opt.detach()
         gt = gt.detach()
         np.save(os.path.join(render_npy_path, '{0:05d}'.format(idx) + ".npy"),rendering_opt.permute(1,2,0).cpu().numpy())
@@ -177,14 +181,22 @@ def render_sets(
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    def select_views(views, max_views):
+        views = list(views)
+        if max_views and max_views > 0 and len(views) > max_views:
+            indices = np.linspace(0, len(views) - 1, max_views, dtype=int)
+            views = [views[i] for i in indices]
+        return views
+
     if not skip_train:
+        train_views = select_views(scene.getTrainCameras(), args.max_train_views)
         with torch.no_grad():
             render_set(
                 dataset.model_path,
                 dataset.source_path,
                 "train",
                 scene.loaded_iter,
-                scene.getTrainCameras(),
+                train_views,
                 gaussians,
                 pipeline,
                 background,
@@ -192,13 +204,14 @@ def render_sets(
             )
 
     if not skip_test:
+        test_views = select_views(scene.getTestCameras(), args.max_test_views)
         if args.optimize_test_pose:
             render_set_optimize(
                 dataset.model_path,
                 dataset.source_path,
                 "test",
                 scene.loaded_iter,
-                scene.getTestCameras(),
+                test_views,
                 gaussians,
                 pipeline,
                 background,
@@ -211,7 +224,7 @@ def render_sets(
                     dataset.source_path,
                     "test",
                     scene.loaded_iter,
-                    scene.getTestCameras(),
+                    test_views,
                     gaussians,
                     pipeline,
                     background,
@@ -230,13 +243,16 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--include_feature", action="store_true")
-    
+    parser.add_argument("--skip_feature_gt", action="store_true")
+
     parser.add_argument("--get_video", action="store_true")
     parser.add_argument("--n_views", default=None, type=int)
     parser.add_argument("--scene", default=None, type=str)
     parser.add_argument("--optimize_test_pose", action="store_true")
     parser.add_argument("--optim_test_pose_iter", default=0, type=int)
     parser.add_argument("--feature_checkpoint_iteration", default=1000, type=int)
+    parser.add_argument("--max_train_views", default=0, type=int)
+    parser.add_argument("--max_test_views", default=0, type=int)
     args = get_combined_args(parser)
     if args.optimize_test_pose and args.optim_test_pose_iter <= 0:
         args.optim_test_pose_iter = 500

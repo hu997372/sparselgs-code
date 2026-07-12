@@ -1,11 +1,12 @@
 {
   "dataset": "waldo_kitchen",
+  "initializer": "dust3r",
   "n_views": null,
   "iterations": 1000,
   "base_feature_level": 3,
   "feature_levels": [2],
   "stages": {
-    "dust3r_init": false,
+    "geometry_init": false,
     "rgb_train": true,
     "sam_clip": true,
     "autoencoder": false,
@@ -18,6 +19,8 @@
   },
   "paths": {
     "dust3r_ckpt": "./ckpt/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+    "mast3r_ckpt": "./ckpt/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+    "vggt_ckpt": "./ckpt/model.pt",
     "sam_ckpt": "./ckpt/sam_vit_h_4b8939.pth",
     "start_checkpoint": null
   },

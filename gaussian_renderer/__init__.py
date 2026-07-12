@@ -83,12 +83,15 @@ def render(
     rel_w2c = get_camera_from_tensor(camera_pose)
     # Transform mean and rot of Gaussians to camera frame
     gaussians_xyz = pc._xyz.clone()
-    gaussians_rot = pc._rotation.clone()
+    gaussians_rot = pc.get_rotation
 
     xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
     xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
     gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
+    camera_quat = torch.nn.functional.normalize(camera_pose[:4], dim=0)
+    gaussians_rot_trans = torch.nn.functional.normalize(
+        quadmultiply(camera_quat, gaussians_rot), dim=-1
+    )
     means3D = gaussians_xyz_trans
 
     means2D = screenspace_points
@@ -103,6 +106,9 @@ def render(
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
+        max_render_scale = float(getattr(opt, "max_render_scale", 0.0) or 0.0)
+        if max_render_scale > 0:
+            scales = torch.clamp(scales, max=max_render_scale)
         rotations = gaussians_rot_trans  # pc.get_rotation
         # rotations = pc.get_rotation
 

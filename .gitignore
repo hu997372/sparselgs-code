@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Native/CUDA builds
+*.so
+build/
+dist/
+*.o
+*.a
+.ninja_*
+
+# Editors and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Models, datasets, and generated results
+ckpt/
+data/
+download/
+output/
+eval_result/
+logs/
+match_results/
+autoencoder/ckpt/
+wandb/
+runs/
+
+# Optional external repositories
+mast3r/
+vggt/
+
+# Generated media
+*.mp4
+*.avi
+*.gif

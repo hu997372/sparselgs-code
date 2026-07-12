@@ -89,6 +89,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._language_feature = None
+        self.test_P = torch.empty(0)
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -166,7 +167,7 @@ class GaussianModel:
             self.P) = model_args
             if not training_args.include_feature: # 如果是以原始gs为初始化来训练feature的话，就不需要restore optimizer
                 self.optimizer.load_state_dict(opt_dict)
-                
+
         if mode == 'train':
             self.training_setup(training_args)
             self.xyz_gradient_accum = xyz_gradient_accum
@@ -201,13 +202,21 @@ class GaussianModel:
 
         return E_rel
 
-    def init_RT_seq(self, cam_list):
+    def _camera_pose_tensor(self, cameras):
         poses =[]
-        for cam in cam_list[1.0]:
+        for cam in cameras:
             p = get_tensor_from_camera(cam.world_view_transform.transpose(0, 1)) # R T -> quat t
             poses.append(p)
+        if not poses:
+            return torch.empty((0, 7), device="cuda")
         poses = torch.stack(poses)
-        self.P = poses.cuda().requires_grad_(True)
+        return poses.cuda().requires_grad_(True)
+
+    def init_RT_seq(self, cam_list):
+        self.P = self._camera_pose_tensor(cam_list[1.0])
+
+    def init_test_RT_seq(self, cam_list):
+        self.test_P = self._camera_pose_tensor(cam_list[1.0])
 
     def get_RT(self, idx):
         pose = self.P[idx]
@@ -241,18 +250,32 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, max_init_points=0, init_point_seed=0, max_init_scale=0.0):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+        max_init_points = int(max_init_points or 0)
+        if max_init_points > 0 and points.shape[0] > max_init_points:
+            rng = np.random.default_rng(int(init_point_seed))
+            selected = np.sort(rng.choice(points.shape[0], max_init_points, replace=False))
+            print(f"Downsampled initial point cloud: {points.shape[0]} -> {max_init_points}")
+            points = points[selected]
+            colors = colors[selected]
+
+        fused_point_cloud = torch.tensor(points).float().cuda()
+        fused_color = RGB2SH(torch.tensor(colors).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(points).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        max_init_scale = float(max_init_scale or 0.0)
+        if max_init_scale > 0:
+            scales = torch.clamp(scales, max=np.log(max_init_scale))
+            print(f"Clamped initial Gaussian scale to <= {max_init_scale}")
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
@@ -276,7 +299,7 @@ class GaussianModel:
                 # 开始feature训练的时候，往模型中加入language feature参数
                 language_feature = torch.zeros((self._xyz.shape[0], 3), device="cuda")
                 self._language_feature = nn.Parameter(language_feature.requires_grad_(True))
-                
+
             l = [
                 {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},

@@ -52,9 +52,9 @@ if __name__ == '__main__':
         batch_size=256,
         shuffle=False,
         num_workers=16,
-        drop_last=False  
+        drop_last=False
     )
-    
+
     encoder_hidden_dims = args.encoder_dims
     decoder_hidden_dims = args.decoder_dims
 
@@ -73,11 +73,11 @@ if __name__ == '__main__':
             # print(data.shape)
             outputs_dim3 = model.encode(data)
             outputs = model.decode(outputs_dim3)
-            
-            l2loss = l2_loss(outputs, data) 
+
+            l2loss = l2_loss(outputs, data)
             cosloss = cos_loss(outputs, data)
             loss = l2loss + cosloss * 0.001
-            
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -94,7 +94,7 @@ if __name__ == '__main__':
             for idx, feature in enumerate(test_loader):
                 data = feature.to("cuda:0")
                 with torch.no_grad():
-                    outputs = model(data) 
+                    outputs = model(data)
                 loss = l2_loss(outputs, data) + cos_loss(outputs, data)
                 eval_loss += loss * len(feature)
             eval_loss = eval_loss / len(train_dataset)
@@ -103,9 +103,9 @@ if __name__ == '__main__':
                 best_eval_loss = eval_loss
                 best_epoch = epoch
                 torch.save(model.state_dict(), f'ckpt/{args.dataset_name}/best_ckpt.pth')
-                
+
             if epoch % 10 == 0:
                 torch.save(model.state_dict(), f'ckpt/{args.dataset_name}/{epoch}_ckpt.pth')
-            
+
     print(f"best_epoch: {best_epoch}")
     print("best_loss: {:.8f}".format(best_eval_loss))
