@@ -213,11 +213,12 @@ Use `--cpu` for codebook recovery on CPU.
 If SparseLGS is useful in your research, please cite:
 
 ```bibtex
-@article{hu2024sparselgs,
-  title   = {SparseLGS: Sparse View Language Embedded Gaussian Splatting},
-  author  = {Jun Hu and Zhang Chen and Zhong Li and Yi Xu and Juyong Zhang},
-  journal = {arXiv preprint arXiv:2412.02245},
-  year    = {2024}
+@article{hu2026sparselgs,
+  title={SparseLGS: Sparse View Language Embedded Gaussian Splatting},
+  author={Jun Hu and Zhang Chen and Zhong Li and Yi Xu and Juyong Zhang},
+  journal={IEEE Transactions on Visualization and Computer Graphics},
+  year={2026},
+  publisher={IEEE}
 }
 ```
 
